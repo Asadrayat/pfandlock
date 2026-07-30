@@ -513,6 +513,136 @@ export async function setProductDeposit(
   }
 }
 
+export interface OnboardingStatus {
+  depositProduct: { id: string; title: string; variantCount: number } | null;
+  pfandFieldDefined: boolean;
+  tiers: Array<{ id: string; amount: number; currency: string; label: string | null }>;
+  cartTransformActive: boolean;
+  shop: {
+    plan: string;
+    isPlus: boolean;
+    isDevelopment: boolean;
+    storefrontUrl: string;
+  };
+  completedSteps: number;
+  totalSteps: number;
+}
+
+/**
+ * Reflects the real setup state behind the four onboarding steps. Every
+ * field is queried, never assumed - a merchant can undo any of these from
+ * the Shopify admin (delete the deposit product, remove every tier), and
+ * this page has to show that honestly rather than remembering it was once
+ * "done".
+ *
+ * Step 2 (the `$app:pfand` product field) is a special case: it's declared
+ * declaratively in shopify.app.toml, so `shopify app deploy` creates it and
+ * no merchant action can complete it. It's still queried rather than
+ * hardcoded true, because a failed/partial deploy is exactly the situation
+ * where a merchant needs to see it missing.
+ */
+export async function getOnboardingStatus(
+  admin: AdminApiContext,
+  shop: string,
+): Promise<OnboardingStatus> {
+  const [tiers, shopConfig, fieldResponse, transformResponse, shopResponse] =
+    await Promise.all([
+      listDepositTiers(shop),
+      prisma.shopConfig.findUnique({ where: { shop } }),
+      admin.graphql(`#graphql
+        query onboardingPfandField {
+          metafieldDefinitions(first: 1, ownerType: PRODUCT, namespace: "${PFAND_METAFIELD_NAMESPACE}", key: "${PFAND_METAFIELD_KEY}") {
+            nodes {
+              id
+            }
+          }
+        }`),
+      admin.graphql(`#graphql
+        query onboardingCartTransform {
+          cartTransforms(first: 1) {
+            nodes {
+              id
+            }
+          }
+        }`),
+      admin.graphql(`#graphql
+        query onboardingShop {
+          shop {
+            myshopifyDomain
+            primaryDomain {
+              url
+            }
+            plan {
+              publicDisplayName
+              partnerDevelopment
+              shopifyPlus
+            }
+          }
+        }`),
+    ]);
+
+  const { data: fieldData } = await fieldResponse.json();
+  const { data: transformData } = await transformResponse.json();
+  const { data: shopData } = await shopResponse.json();
+
+  // The stored product id can outlive the product itself (a merchant can
+  // delete it from the admin), so confirm it still resolves before calling
+  // step 1 done.
+  let depositProduct: OnboardingStatus["depositProduct"] = null;
+  if (shopConfig?.depositProductId) {
+    const productResponse = await admin.graphql(
+      `#graphql
+        query onboardingDepositProduct($id: ID!) {
+          product(id: $id) {
+            id
+            title
+            variantsCount { count }
+          }
+        }`,
+      { variables: { id: shopConfig.depositProductId } },
+    );
+    const { data: productData } = await productResponse.json();
+    if (productData?.product) {
+      depositProduct = {
+        id: productData.product.id,
+        title: productData.product.title,
+        variantCount: productData.product.variantsCount.count,
+      };
+    }
+  }
+
+  const pfandFieldDefined = fieldData.metafieldDefinitions.nodes.length > 0;
+  const cartTransformActive = transformData.cartTransforms.nodes.length > 0;
+
+  const completedSteps = [
+    depositProduct !== null,
+    pfandFieldDefined,
+    tiers.length > 0,
+    cartTransformActive,
+  ].filter(Boolean).length;
+
+  return {
+    depositProduct,
+    pfandFieldDefined,
+    tiers: tiers.map((tier) => ({
+      id: tier.id,
+      amount: tier.amount,
+      currency: tier.currency,
+      label: tier.label,
+    })),
+    cartTransformActive,
+    shop: {
+      plan: shopData.shop.plan.publicDisplayName,
+      isPlus: shopData.shop.plan.shopifyPlus,
+      isDevelopment: shopData.shop.plan.partnerDevelopment,
+      storefrontUrl:
+        shopData.shop.primaryDomain?.url ?? `https://${shopData.shop.myshopifyDomain}`,
+    },
+    completedSteps,
+    totalSteps: 4,
+  };
+}
+
 export interface ActivityEvent {
   id: string;
   message: string;
