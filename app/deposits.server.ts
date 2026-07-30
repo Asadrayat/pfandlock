@@ -512,3 +512,44 @@ export async function setProductDeposit(
     throw new Error(userErrors.map((e: { message: string }) => e.message).join(", "));
   }
 }
+
+export interface ActivityEvent {
+  id: string;
+  message: string;
+  detail: string | null;
+  when: Date;
+}
+
+export interface ActivitySummary {
+  events: ActivityEvent[];
+  configChangeCount: number;
+}
+
+/**
+ * The only real activity signal this app currently has: DepositTier rows'
+ * own createdAt/updatedAt timestamps. There's no dedicated audit log (no
+ * record of *who* made a change, and no events for product assignments or
+ * settings toggles), and no way to observe blocked checkouts or runtime
+ * errors here - Shopify doesn't expose validation-function outcomes to
+ * apps (a validation error surfaces only to the buyer's own cart/checkout,
+ * never back to the app), and this app doesn't log its own errors anywhere
+ * yet. The route renders honest empty states for both rather than
+ * pretending either is tracked.
+ */
+export async function getActivitySummary(shop: string): Promise<ActivitySummary> {
+  const tiers = await prisma.depositTier.findMany({ where: { shop } });
+
+  const events: ActivityEvent[] = tiers.map((tier) => {
+    const wasEdited = tier.updatedAt.getTime() !== tier.createdAt.getTime();
+    return {
+      id: tier.id,
+      message: `${formatAmount(tier.amount, tier.currency)} amount ${wasEdited ? "updated" : "added"}`,
+      detail: tier.label,
+      when: wasEdited ? tier.updatedAt : tier.createdAt,
+    };
+  });
+
+  events.sort((a, b) => b.when.getTime() - a.when.getTime());
+
+  return { events, configChangeCount: events.length };
+}
