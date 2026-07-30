@@ -1,9 +1,11 @@
 query CartValidationsGenerateRunInput {
   cart {
     lines {
+      quantity
       merchandise {
         __typename
         ... on ProductVariant {
+          id
           product {
             title
             pfand: metafield(namespace: "$app", key: "pfand") {

@@ -363,6 +363,90 @@ export async function getProductDepositDetail(
   };
 }
 
+export interface DashboardSummary {
+  tiers: Array<{
+    id: string;
+    amount: number;
+    currency: string;
+    label: string | null;
+    productCount: number;
+  }>;
+  totalProductCount: number;
+  attachingCount: number;
+  orphanedProducts: Array<{ id: string; title: string; amount: number; currency: string }>;
+  cartTransformActive: boolean;
+}
+
+/**
+ * Aggregates the real state the dashboard renders: tier config, product
+ * coverage, and orphaned products. Scans up to 250 products (a single Admin
+ * API page) for the coverage breakdown - fine at this app's current catalog
+ * size, but won't reflect every product once a shop has more than that.
+ * Deliberately has no notion of orders/collected-deposit totals - those
+ * don't exist until Activity tracking is built, so the dashboard route
+ * renders an empty state for them rather than calling this for numbers it
+ * doesn't have.
+ */
+export async function getDashboardSummary(
+  admin: AdminApiContext,
+  shop: string,
+): Promise<DashboardSummary> {
+  const [tiers, countResponse, transformResponse, products] = await Promise.all([
+    listDepositTiers(shop),
+    admin.graphql(`#graphql
+      query dashboardProductsCount {
+        productsCount {
+          count
+        }
+      }`),
+    admin.graphql(`#graphql
+      query dashboardCartTransformStatus {
+        cartTransforms(first: 1) {
+          nodes {
+            id
+          }
+        }
+      }`),
+    listProductsWithDepositStatus(admin, shop, { first: 250 }),
+  ]);
+
+  const { data: countData } = await countResponse.json();
+  const { data: transformData } = await transformResponse.json();
+
+  let attachingCount = 0;
+  const productCountByTier = new Map<string, number>();
+  const orphanedProducts: DashboardSummary["orphanedProducts"] = [];
+  for (const product of products) {
+    if (product.status.state === "attaching") {
+      attachingCount++;
+      const tierKey = `${product.status.tier.amount}:${product.status.tier.currency}`;
+      productCountByTier.set(tierKey, (productCountByTier.get(tierKey) ?? 0) + 1);
+    }
+    if (product.status.state === "orphaned") {
+      orphanedProducts.push({
+        id: product.id,
+        title: product.title,
+        amount: product.status.amount,
+        currency: product.status.currency,
+      });
+    }
+  }
+
+  return {
+    tiers: tiers.map((tier) => ({
+      id: tier.id,
+      amount: tier.amount,
+      currency: tier.currency,
+      label: tier.label,
+      productCount: productCountByTier.get(`${tier.amount}:${tier.currency}`) ?? 0,
+    })),
+    totalProductCount: countData.productsCount.count,
+    attachingCount,
+    orphanedProducts,
+    cartTransformActive: transformData.cartTransforms.nodes.length > 0,
+  };
+}
+
 /** Writes (or clears) a single product's deposit assignment. */
 export async function setProductDeposit(
   admin: AdminApiContext,

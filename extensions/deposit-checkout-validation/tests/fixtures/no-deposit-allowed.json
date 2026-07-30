@@ -6,8 +6,10 @@
       "cart": {
         "lines": [
           {
+            "quantity": 1,
             "merchandise": {
               "__typename": "ProductVariant",
+              "id": "gid://shopify/ProductVariant/1",
               "product": {
                 "title": "Plain T-Shirt",
                 "pfand": null

@@ -1,20 +1,31 @@
 {
   "payload": {
-    "export": "cart-transform-run",
-    "target": "cart.transform.run",
+    "export": "cart-validations-generate-run",
+    "target": "cart.validations.generate.run",
     "input": {
       "cart": {
         "lines": [
           {
-            "id": "gid://shopify/CartLine/1",
-            "quantity": 2,
+            "quantity": 12,
             "merchandise": {
               "__typename": "ProductVariant",
               "id": "gid://shopify/ProductVariant/1",
               "product": {
+                "title": "Glass Bottle",
                 "pfand": {
                   "jsonValue": { "amount": "0.08", "currency_code": "EUR" }
                 }
+              }
+            }
+          },
+          {
+            "quantity": 4,
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "id": "gid://shopify/ProductVariant/999",
+              "product": {
+                "title": "Pfand (Deposit)",
+                "pfand": null
               }
             }
           }
@@ -31,16 +42,11 @@
     "output": {
       "operations": [
         {
-          "lineExpand": {
-            "cartLineId": "gid://shopify/CartLine/1",
-            "expandedCartItems": [
+          "validationAdd": {
+            "errors": [
               {
-                "merchandiseId": "gid://shopify/ProductVariant/1",
-                "quantity": 1
-              },
-              {
-                "merchandiseId": "gid://shopify/ProductVariant/999",
-                "quantity": 1
+                "message": "The refundable deposit (Pfand) for your items is missing or incorrect. Refresh your cart to continue.",
+                "target": "$.cart"
               }
             ]
           }

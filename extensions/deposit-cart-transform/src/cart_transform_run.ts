@@ -42,14 +42,18 @@ export function cartTransformRun(input: CartTransformRunInput): CartTransformRun
     // line gets added (nothing to charge without a known variant).
     if (!tier) continue;
 
+    // expandedCartItems replaces the line entirely (it becomes the bundle's
+    // full component list), so the product itself must be listed alongside
+    // the deposit - omitting it would drop the product from the cart. Each
+    // entry's quantity is per parent unit; Shopify multiplies it by the
+    // line's own quantity, so quantity:1 here is what gives the 1:1 scaling
+    // (matches Shopify's own gift-wrap/assembly-service expand examples).
     operations.push({
       lineExpand: {
         cartLineId: line.id,
         expandedCartItems: [
-          {
-            merchandiseId: tier.variantId,
-            quantity: line.quantity,
-          },
+          { merchandiseId: line.merchandise.id, quantity: 1 },
+          { merchandiseId: tier.variantId, quantity: 1 },
         ],
       },
     });
