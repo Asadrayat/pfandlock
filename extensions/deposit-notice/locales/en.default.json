@@ -1,0 +1,5 @@
+{
+  "deposit_notice": {
+    "text": "Includes a {{ amount }} refundable Pfand deposit, charged at checkout."
+  }
+}

@@ -1,0 +1,23 @@
+{% comment %}
+  Reads the product's own $app:pfand metafield directly - no cross-reference
+  against DepositTier/orphaned state here, since Liquid can't reach our DB.
+  An orphaned amount still renders a notice; checkout validation (Phase 2)
+  is what actually blocks the buyer if the amount turns out unconfigured.
+{% endcomment %}
+{% assign pfand = block.settings.product.metafields.app.pfand %}
+{% if pfand.value %}
+  {% assign deposit_amount = pfand.value | money %}
+  <p class="pfandlock-deposit-notice">
+    {{ 'deposit_notice.text' | t: amount: deposit_amount }}
+  </p>
+{% endif %}
+
+{% schema %}
+{
+  "name": "Deposit notice",
+  "target": "section",
+  "settings": [
+    { "type": "product", "id": "product", "label": "Product", "autofill": true }
+  ]
+}
+{% endschema %}

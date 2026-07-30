@@ -1,0 +1,61 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "a1dd92316574d0b4f46a31c984c364ae"
+application_url = "https://example.com"
+embedded = true
+name = "Pfandlock"
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+# write_products covers both reading and writing products/variants/metafields,
+# which is everything Phase 1 (tiers + product assignment) needs.
+# write_cart_transforms is Phase 2's: it's what lets the app call
+# cartTransformCreate to register the deposit-charging Cart Transform
+# function for a shop (see app/routes/app.settings.tsx).
+scopes = "write_products,write_cart_transforms"
+
+# Declarative product metafield: the field a product's deposit amount lives
+# on. This is the field the "Assign deposit" page writes to and the field the
+# Phase 3 storefront extension (deposit-notice) reads from - the app itself
+# never stores product-to-tier assignment, this metafield is that assignment.
+[product.metafields.app.pfand]
+type = "money"
+name = "Pfand deposit amount"
+description = "The refundable deposit amount for this product. Must match one of the deposit amounts configured in the Pfandlock app, or checkout will be blocked."
+
+  [product.metafields.app.pfand.access]
+  admin = "merchant_read_write"
+  storefront = "public_read"
+
+[webhooks]
+# Matches app/shopify.server.ts's ApiVersion.July26 - the installed
+# @shopify/shopify-api SDK doesn't define a newer enum value yet, so this is
+# the newest version both the Admin client and webhooks can consistently
+# use. Function extensions (deposit-cart-transform, deposit-checkout-
+# validation) version independently by design - see their own
+# shopify.extension.toml files.
+api_version = "2026-07"
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/uninstalled"
+  topics = [ "app/uninstalled" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/scopes_update"
+  topics = [ "app/scopes_update" ]
+
+  # Mandatory GDPR compliance webhooks, required for App Store distribution.
+  # These three share one endpoint (Shopify's requirement - they don't get
+  # individual `topics` subscriptions). We hold no customer PII, so the
+  # customer topics are pure acknowledgements; shop/redact is the one that
+  # actually deletes data (see app/routes/webhooks.compliance.tsx).
+  [[webhooks.subscriptions]]
+  compliance_topics = [ "customers/data_request", "customers/redact", "shop/redact" ]
+  uri = "/webhooks/compliance"
+
+[auth]
+redirect_urls = [ "https://example.com/api/auth" ]
+
+[build]
+include_config_on_deploy = true
+automatically_update_urls_on_dev = true

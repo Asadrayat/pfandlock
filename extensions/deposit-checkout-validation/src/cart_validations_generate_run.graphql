@@ -1,0 +1,22 @@
+query CartValidationsGenerateRunInput {
+  cart {
+    lines {
+      merchandise {
+        __typename
+        ... on ProductVariant {
+          product {
+            title
+            pfand: metafield(namespace: "$app", key: "pfand") {
+              jsonValue
+            }
+          }
+        }
+      }
+    }
+  }
+  shop {
+    depositTiers: metafield(namespace: "$app", key: "deposit_tiers") {
+      jsonValue
+    }
+  }
+}

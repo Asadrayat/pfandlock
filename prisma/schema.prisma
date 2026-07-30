@@ -1,0 +1,85 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
+// enough when changing adapters.
+// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // url      = "file:dev.sqlite"
+}
+
+model Session {
+  id            String    @id
+  shop          String
+  state         String
+  isOnline      Boolean   @default(false)
+  scope         String?
+  expires       DateTime?
+  accessToken   String
+  userId        BigInt?
+  firstName     String?
+  lastName      String?
+  email         String?
+  accountOwner  Boolean   @default(false)
+  locale        String?
+  collaborator  Boolean?  @default(false)
+  emailVerified Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+// One row per shop. Holds the shop-wide state that isn't a deposit tier itself,
+// namely which Shopify product we're using as the hidden "Pfand (Deposit)"
+// product whose variants back every tier's price. Nullable until onboarding
+// step 1 creates that product for the first time.
+model ShopConfig {
+  shop             String   @id
+  depositProductId String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+// A deposit amount a merchant can charge (e.g. "€0.08 - Single-use bottle").
+// Each tier is backed by one variant on the shop's hidden deposit product -
+// that variant's price is what actually gets charged at checkout, so this
+// table is metadata *about* that variant, not a separate source of price truth.
+//
+// Product-to-tier assignment is NOT stored here. It lives on the product's
+// own `custom.pfand` metafield (declared in shopify.app.toml), so the
+// storefront and any other reader can see it without going through our app.
+// We only look up tiers by amount to tell whether a product's metafield
+// value has a configured tier behind it or is "orphaned".
+model DepositTier {
+  id        String   @id @default(cuid())
+  shop      String
+  // Stored in minor units (cents) - money math on floats is a bug generator.
+  // €0.08 is `amount = 8`.
+  amount    Int
+  currency  String   @default("EUR")
+  // Merchant + buyer facing name, e.g. "Single-use bottle". Optional - the
+  // amount alone is a valid label.
+  label     String?
+  // GID of the ProductVariant on ShopConfig.depositProductId that carries
+  // this tier's price, e.g. "gid://shopify/ProductVariant/123".
+  variantId String
+  chargeTax Boolean  @default(false)
+  // Soft-disable instead of deleting, so products already tagged with this
+  // amount keep their history instead of suddenly looking "orphaned".
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // One tier per amount+currency per shop - two €0.08 tiers would be
+  // ambiguous for both the merchant and the "does this product's metafield
+  // match a tier" lookup. Currency is part of the key too, since a shop
+  // selling in multiple currencies could otherwise never have, say, both an
+  // €8 and a $8 tier.
+  @@unique([shop, amount, currency])
+  @@index([shop])
+}
