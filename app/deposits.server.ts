@@ -513,6 +513,135 @@ export async function setProductDeposit(
   }
 }
 
+/** Hard ceiling on the export's product scan - a runaway-pagination guard. */
+const MIGRATION_PRODUCT_SCAN_LIMIT = 5000;
+
+export interface MigrationExport {
+  version: number;
+  sourceShop: string;
+  enforcementActive: boolean;
+  tiers: Array<{
+    amount: number;
+    currency: string;
+    label: string | null;
+    chargeTax: boolean;
+  }>;
+  productAssignments: Array<{
+    handle: string;
+    title: string;
+    skus: string[];
+    amount: number;
+    currency: string;
+  }>;
+  /** True when the scan hit MIGRATION_PRODUCT_SCAN_LIMIT and stopped early. */
+  truncated: boolean;
+}
+
+/**
+ * Builds the portable configuration for moving this setup to another store.
+ *
+ * Deliberately contains NO variant or product GIDs: those are per-store, and
+ * hard-coding them is exactly what breaks a migration. Products are
+ * identified by handle plus variant SKUs so the destination store can match
+ * its own catalogue and re-derive its own ids.
+ *
+ * Paginates the whole catalogue rather than taking a single page like the
+ * dashboard does - a dashboard that undercounts is a cosmetic bug, but an
+ * export that silently omits products would hand the client a store where
+ * some deposits just don't exist.
+ */
+export async function getMigrationExport(
+  admin: AdminApiContext,
+  shop: string,
+): Promise<MigrationExport> {
+  const [tiers, transformResponse] = await Promise.all([
+    listDepositTiers(shop),
+    admin.graphql(`#graphql
+      query migrationCartTransform {
+        cartTransforms(first: 1) {
+          nodes {
+            id
+          }
+        }
+      }`),
+  ]);
+  const { data: transformData } = await transformResponse.json();
+
+  interface ProductNode {
+    handle: string;
+    title: string;
+    pfand?: { jsonValue?: { amount: string; currency_code: string } };
+    variants: { nodes: Array<{ sku: string | null }> };
+  }
+
+  const productAssignments: MigrationExport["productAssignments"] = [];
+  let after: string | null = null;
+  let scanned = 0;
+  let truncated = false;
+
+  for (;;) {
+    const response: Response = await admin.graphql(
+      `#graphql
+        query migrationProducts($first: Int!, $after: String) {
+          products(first: $first, after: $after) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              handle
+              title
+              pfand: metafield(namespace: "${PFAND_METAFIELD_NAMESPACE}", key: "${PFAND_METAFIELD_KEY}") {
+                jsonValue
+              }
+              variants(first: 100) {
+                nodes { sku }
+              }
+            }
+          }
+        }`,
+      { variables: { first: 250, after } },
+    );
+    const { data } = await response.json();
+
+    for (const node of data.products.nodes as ProductNode[]) {
+      const parsed = node.pfand?.jsonValue;
+      if (!parsed) continue; // no deposit assigned - nothing to carry over
+
+      productAssignments.push({
+        handle: node.handle,
+        title: node.title,
+        skus: node.variants.nodes
+          .map((variant) => variant.sku)
+          .filter((sku): sku is string => Boolean(sku)),
+        // Stored in minor units to match DepositTier, not the metafield's
+        // decimal string - the importer compares against tier amounts.
+        amount: Math.round(parseFloat(parsed.amount) * 100),
+        currency: parsed.currency_code,
+      });
+    }
+
+    scanned += data.products.nodes.length;
+    if (scanned >= MIGRATION_PRODUCT_SCAN_LIMIT) {
+      truncated = data.products.pageInfo.hasNextPage;
+      break;
+    }
+    if (!data.products.pageInfo.hasNextPage) break;
+    after = data.products.pageInfo.endCursor;
+  }
+
+  return {
+    version: 1,
+    sourceShop: shop,
+    enforcementActive: transformData.cartTransforms.nodes.length > 0,
+    tiers: tiers.map((tier) => ({
+      amount: tier.amount,
+      currency: tier.currency,
+      label: tier.label,
+      chargeTax: tier.chargeTax,
+    })),
+    productAssignments,
+    truncated,
+  };
+}
+
 export interface OnboardingStatus {
   depositProduct: { id: string; title: string; variantCount: number } | null;
   pfandFieldDefined: boolean;

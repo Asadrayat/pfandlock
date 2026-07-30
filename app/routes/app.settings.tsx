@@ -110,6 +110,14 @@ export default function Settings() {
           of only at checkout.
         </s-paragraph>
       </s-section>
+
+      <s-section heading="Advanced">
+        <s-paragraph>
+          Moving to another store? Export your deposit amounts and
+          product assignments so they can be rebuilt there.
+        </s-paragraph>
+        <s-button href="/app/migration">Export configuration</s-button>
+      </s-section>
     </s-page>
   );
 }
