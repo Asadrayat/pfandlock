@@ -5,12 +5,16 @@ import { defineConfig } from "vitest/config";
 // none of which a Node-side unit test needs, and the plugin's route typegen
 // makes the run slower and more fragile than the tests themselves.
 //
-// Scoped to `app/` on purpose: each function extension owns its own vitest
-// config and runs against the Shopify function test helpers, so pulling
-// extensions/ in here would run those suites twice under the wrong setup.
+// The two *function* extensions are deliberately not included: each owns a
+// vitest config and runs against the Shopify function test helpers, so
+// pulling them in here would run those suites twice under the wrong setup.
+//
+// deposit-notice is the exception. It's a theme extension with no package
+// of its own and nothing to build - its tests only read files - so this is
+// the only runner it has.
 export default defineConfig({
   test: {
-    include: ["app/**/*.test.ts"],
+    include: ["app/**/*.test.ts", "extensions/deposit-notice/**/*.test.ts"],
     environment: "node",
   },
 });
