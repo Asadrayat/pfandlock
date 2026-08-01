@@ -27,6 +27,7 @@ import {
   getDashboardSummary,
   getMigrationExport,
   getOnboardingStatus,
+  getProductDepositDetail,
   idFromGid,
   parseMigrationExportFile,
   previewMigrationImport,
@@ -2462,5 +2463,128 @@ describe("getActivitySummary", () => {
     const summary = await getActivitySummary(SHOP);
 
     expect(summary).toEqual({ events: [], configChangeCount: 0 });
+  });
+});
+
+describe("getProductDepositDetail", () => {
+  const PRODUCT = "gid://shopify/Product/1";
+
+  const fakeProduct = (options: {
+    tiers?: Array<ReturnType<typeof tierRow>>;
+    product?: {
+      title?: string;
+      vendor?: string;
+      variantCount?: number;
+      pfand?: { amount: string; currency_code: string } | null;
+    } | null;
+  } = {}) => {
+    findMany.mockResolvedValue(options.tiers ?? []);
+
+    const queryVariables: Array<Record<string, unknown>> = [];
+    const graphql = vi.fn(
+      async (query: string, init?: { variables?: Record<string, unknown> }) => {
+        const reply = (data: unknown) => ({ json: async () => ({ data }) });
+
+        if (query.includes("query productDepositDetail")) {
+          queryVariables.push(init?.variables ?? {});
+          // `product: null` is what Shopify returns for an id that no
+          // longer resolves, not an error.
+          if (options.product === null) return reply({ product: null });
+
+          const product = options.product ?? {};
+          return reply({
+            product: {
+              id: PRODUCT,
+              title: product.title ?? "Sparkling Water",
+              vendor: product.vendor ?? "Acme",
+              variantsCount: { count: product.variantCount ?? 3 },
+              pfand: product.pfand ? { jsonValue: product.pfand } : null,
+            },
+          });
+        }
+
+        throw new Error(`fakeProduct got an unexpected operation:\n${query}`);
+      },
+    );
+
+    return { admin: { graphql } as unknown as AdminApiContext, graphql, queryVariables };
+  };
+
+  it("returns the product's basic details", async () => {
+    const store = fakeProduct({
+      product: { title: "Sparkling Water", vendor: "Acme", variantCount: 3 },
+    });
+
+    const detail = await getProductDepositDetail(store.admin, SHOP, PRODUCT);
+
+    expect(detail).toEqual({
+      id: PRODUCT,
+      title: "Sparkling Water",
+      vendor: "Acme",
+      totalVariants: 3,
+      status: { state: "no-deposit" },
+    });
+    expect(store.queryVariables).toEqual([{ id: PRODUCT }]);
+  });
+
+  it("returns null for a product that no longer exists", async () => {
+    // The assign page is reachable by URL, so a deleted product has to come
+    // back as "not found" rather than throwing on a null.
+    const store = fakeProduct({ product: null });
+
+    const detail = await getProductDepositDetail(store.admin, SHOP, PRODUCT);
+
+    expect(detail).toBeNull();
+  });
+
+  it("resolves a deposit that has a matching tier", async () => {
+    const store = fakeProduct({
+      tiers: [tierRow(8, { label: "Bottle" })],
+      product: { pfand: { amount: "0.08", currency_code: "EUR" } },
+    });
+
+    const detail = await getProductDepositDetail(store.admin, SHOP, PRODUCT);
+
+    expect(detail?.status).toEqual({
+      state: "attaching",
+      tier: expect.objectContaining({ amount: 8, currency: "EUR", label: "Bottle" }),
+    });
+  });
+
+  it("translates the metafield's currency_code before matching", async () => {
+    // The money metafield uses snake_case; resolveDepositStatus expects
+    // currencyCode. Passing it through unmapped would leave the currency
+    // undefined and read every assigned deposit as orphaned.
+    const store = fakeProduct({
+      tiers: [tierRow(800, { currency: "USD" })],
+      product: { pfand: { amount: "8.00", currency_code: "USD" } },
+    });
+
+    const detail = await getProductDepositDetail(store.admin, SHOP, PRODUCT);
+
+    expect(detail?.status.state).toBe("attaching");
+  });
+
+  it("flags a deposit with no backing tier as orphaned", async () => {
+    const store = fakeProduct({
+      tiers: [tierRow(8)],
+      product: { pfand: { amount: "0.25", currency_code: "EUR" } },
+    });
+
+    const detail = await getProductDepositDetail(store.admin, SHOP, PRODUCT);
+
+    expect(detail?.status).toEqual({
+      state: "orphaned",
+      amount: 25,
+      currency: "EUR",
+    });
+  });
+
+  it("reports no deposit when the metafield is unset", async () => {
+    const store = fakeProduct({ tiers: [tierRow(8)], product: {} });
+
+    const detail = await getProductDepositDetail(store.admin, SHOP, PRODUCT);
+
+    expect(detail?.status).toEqual({ state: "no-deposit" });
   });
 });
