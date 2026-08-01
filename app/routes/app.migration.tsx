@@ -109,7 +109,7 @@ export default function Migration() {
   const withoutSku = data.productAssignments.length - withSku;
 
   return (
-    <s-page heading="Move this setup to another store" inlineSize="small">
+    <s-page heading="Move this setup to another store">
       <s-link slot="breadcrumb-actions" href="/app/settings">
         Settings
       </s-link>

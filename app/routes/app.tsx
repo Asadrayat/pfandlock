@@ -37,6 +37,7 @@ export default function App() {
         <s-link href="/app/activity">Activity</s-link>
         <s-link href="/app/settings">Settings</s-link>
         <s-link href="/app/onboarding">Setup</s-link>
+        <s-link href="/app/migration">Move stores</s-link>
       </s-app-nav>
       <Outlet />
     </AppProvider>
