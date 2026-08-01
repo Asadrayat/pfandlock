@@ -22,6 +22,7 @@ import prisma from "./db.server";
 import {
   applyMigrationImport,
   formatAmount,
+  getMigrationExport,
   idFromGid,
   parseMigrationExportFile,
   previewMigrationImport,
@@ -84,7 +85,8 @@ interface CatalogueProduct {
   id: string;
   handle: string;
   title: string;
-  skus?: string[];
+  /** null models a variant with no SKU set, which the real API returns. */
+  skus?: Array<string | null>;
   pfand?: { amount: string; currency_code: string } | null;
 }
 
@@ -1040,5 +1042,295 @@ describe("applyMigrationImport", () => {
       productsSkipped: 1,
       unmatched: 1,
     });
+  });
+});
+
+describe("getMigrationExport", () => {
+  /**
+   * A source store to export from. Catalogue pages are replayed in order so
+   * pagination is exercised rather than assumed.
+   */
+  const fakeSourceStore = (options: {
+    pages?: Array<{ products: CatalogueProduct[]; hasNextPage?: boolean }>;
+    cartTransforms?: Array<{ id: string }>;
+  }) => {
+    const pages = options.pages ?? [{ products: [] }];
+    const cursors: Array<string | null> = [];
+    let page = 0;
+
+    const graphql = vi.fn(
+      async (query: string, init?: { variables?: Record<string, unknown> }) => {
+        const reply = (data: unknown) => ({ json: async () => ({ data }) });
+
+        if (query.includes("query migrationCartTransform")) {
+          return reply({
+            cartTransforms: { nodes: options.cartTransforms ?? [] },
+          });
+        }
+
+        if (query.includes("query migrationProducts")) {
+          cursors.push((init?.variables?.after as string | null) ?? null);
+          const current = pages[page++];
+          return reply({
+            products: {
+              pageInfo: {
+                hasNextPage: current.hasNextPage ?? false,
+                endCursor: `cursor-${page}`,
+              },
+              nodes: current.products.map(catalogueNode),
+            },
+          });
+        }
+
+        throw new Error(`fakeSourceStore got an unexpected operation:\n${query}`);
+      },
+    );
+
+    return { admin: { graphql } as unknown as AdminApiContext, graphql, cursors };
+  };
+
+  it("exports tiers without any store-specific ids", async () => {
+    // The whole point of the file is portability. A variantId or a row id
+    // leaking in is what would make the import silently target a variant
+    // that doesn't exist on the destination.
+    findMany.mockResolvedValue([
+      tierRow(8, { label: "Bottle", variantId: "gid://shopify/ProductVariant/99" }),
+    ]);
+    const { admin } = fakeSourceStore({});
+
+    const data = await getMigrationExport(admin, "old.myshopify.com");
+
+    expect(data.tiers).toEqual([
+      { amount: 8, currency: "EUR", label: "Bottle", chargeTax: false },
+    ]);
+  });
+
+  it("carries the identity fields the importer matches on", async () => {
+    findMany.mockResolvedValue([]);
+    const { admin } = fakeSourceStore({
+      pages: [
+        {
+          products: [
+            {
+              id: "gid://shopify/Product/1",
+              handle: "sparkling-water",
+              title: "Sparkling Water",
+              skus: ["SKU-1", "SKU-2"],
+              pfand: { amount: "0.08", currency_code: "EUR" },
+            },
+          ],
+        },
+      ],
+    });
+
+    const data = await getMigrationExport(admin, "old.myshopify.com");
+
+    // Handle and SKUs, no product GID - same reasoning as the tiers.
+    expect(data.productAssignments).toEqual([
+      {
+        handle: "sparkling-water",
+        title: "Sparkling Water",
+        skus: ["SKU-1", "SKU-2"],
+        amount: 8,
+        currency: "EUR",
+      },
+    ]);
+  });
+
+  it("leaves out products with no deposit assigned", async () => {
+    findMany.mockResolvedValue([]);
+    const { admin } = fakeSourceStore({
+      pages: [
+        {
+          products: [
+            { id: "gid://shopify/Product/1", handle: "plain", title: "Plain" },
+            {
+              id: "gid://shopify/Product/2",
+              handle: "with-deposit",
+              title: "With Deposit",
+              pfand: { amount: "0.15", currency_code: "EUR" },
+            },
+          ],
+        },
+      ],
+    });
+
+    const data = await getMigrationExport(admin, "old.myshopify.com");
+
+    expect(data.productAssignments).toHaveLength(1);
+    expect(data.productAssignments[0].handle).toBe("with-deposit");
+  });
+
+  it("converts the metafield's decimal string back to minor units", async () => {
+    // The importer compares these against tier amounts, which are integers.
+    // 0.29 * 100 is 28.999999999999996, so this has to round, not truncate.
+    findMany.mockResolvedValue([]);
+    const { admin } = fakeSourceStore({
+      pages: [
+        {
+          products: [
+            {
+              id: "gid://shopify/Product/1",
+              handle: "a",
+              title: "A",
+              pfand: { amount: "0.29", currency_code: "EUR" },
+            },
+            {
+              id: "gid://shopify/Product/2",
+              handle: "b",
+              title: "B",
+              pfand: { amount: "15.00", currency_code: "EUR" },
+            },
+          ],
+        },
+      ],
+    });
+
+    const data = await getMigrationExport(admin, "old.myshopify.com");
+
+    expect(data.productAssignments.map((product) => product.amount)).toEqual([
+      29, 1500,
+    ]);
+  });
+
+  it("drops variants with no SKU rather than exporting nulls", async () => {
+    // A null in this list would be carried into the import and matched
+    // against, where it can never hit anything.
+    findMany.mockResolvedValue([]);
+    const { admin } = fakeSourceStore({
+      pages: [
+        {
+          products: [
+            {
+              id: "gid://shopify/Product/1",
+              handle: "mixed",
+              title: "Mixed",
+              skus: ["SKU-1", null, "SKU-2"],
+              pfand: { amount: "0.08", currency_code: "EUR" },
+            },
+          ],
+        },
+      ],
+    });
+
+    const data = await getMigrationExport(admin, "old.myshopify.com");
+
+    expect(data.productAssignments[0].skus).toEqual(["SKU-1", "SKU-2"]);
+  });
+
+  it("records whether checkout enforcement is switched on", async () => {
+    findMany.mockResolvedValue([]);
+
+    const off = await getMigrationExport(
+      fakeSourceStore({}).admin,
+      "old.myshopify.com",
+    );
+    expect(off.enforcementActive).toBe(false);
+
+    const on = await getMigrationExport(
+      fakeSourceStore({ cartTransforms: [{ id: "gid://shopify/CartTransform/1" }] })
+        .admin,
+      "old.myshopify.com",
+    );
+    expect(on.enforcementActive).toBe(true);
+  });
+
+  it("walks every catalogue page, following the cursor", async () => {
+    // An export that stopped at page one would hand the client a store
+    // where some deposits just don't exist.
+    findMany.mockResolvedValue([]);
+    const store = fakeSourceStore({
+      pages: [
+        {
+          products: [
+            {
+              id: "gid://shopify/Product/1",
+              handle: "page-one",
+              title: "One",
+              pfand: { amount: "0.08", currency_code: "EUR" },
+            },
+          ],
+          hasNextPage: true,
+        },
+        {
+          products: [
+            {
+              id: "gid://shopify/Product/2",
+              handle: "page-two",
+              title: "Two",
+              pfand: { amount: "0.15", currency_code: "EUR" },
+            },
+          ],
+        },
+      ],
+    });
+
+    const data = await getMigrationExport(store.admin, "old.myshopify.com");
+
+    expect(data.productAssignments.map((product) => product.handle)).toEqual([
+      "page-one",
+      "page-two",
+    ]);
+    // First page starts with no cursor, the second resumes from the first's.
+    expect(store.cursors).toEqual([null, "cursor-1"]);
+  });
+
+  it("flags a catalogue too large to scan in full", async () => {
+    findMany.mockResolvedValue([]);
+    const store = fakeSourceStore({
+      pages: [
+        {
+          products: Array.from({ length: 5000 }, (_, index) => ({
+            id: `gid://shopify/Product/${index}`,
+            handle: `product-${index}`,
+            title: `Product ${index}`,
+          })),
+          hasNextPage: true,
+        },
+      ],
+    });
+
+    const data = await getMigrationExport(store.admin, "old.myshopify.com");
+
+    expect(data.truncated).toBe(true);
+    // Stopped at the limit rather than paging on forever.
+    expect(store.cursors).toHaveLength(1);
+  });
+
+  it("stamps the version and source shop the importer reads", async () => {
+    findMany.mockResolvedValue([]);
+    const { admin } = fakeSourceStore({});
+
+    const data = await getMigrationExport(admin, "old.myshopify.com");
+
+    expect(data.version).toBe(1);
+    expect(data.sourceShop).toBe("old.myshopify.com");
+  });
+
+  it("produces a file the importer accepts unchanged", async () => {
+    // Export and import are only useful as a pair. This is the assertion
+    // that fails if either side's shape drifts from the other.
+    findMany.mockResolvedValue([tierRow(8, { label: "Bottle" })]);
+    const { admin } = fakeSourceStore({
+      pages: [
+        {
+          products: [
+            {
+              id: "gid://shopify/Product/1",
+              handle: "sparkling-water",
+              title: "Sparkling Water",
+              skus: ["SKU-1"],
+              pfand: { amount: "0.08", currency_code: "EUR" },
+            },
+          ],
+        },
+      ],
+      cartTransforms: [{ id: "gid://shopify/CartTransform/1" }],
+    });
+
+    const data = await getMigrationExport(admin, "old.myshopify.com");
+    const reparsed = parseMigrationExportFile(JSON.stringify(data, null, 2));
+
+    expect(reparsed).toEqual(data);
   });
 });
