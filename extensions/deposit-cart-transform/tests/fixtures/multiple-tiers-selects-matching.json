@@ -1,0 +1,53 @@
+{
+  "payload": {
+    "export": "cart-transform-run",
+    "target": "cart.transform.run",
+    "input": {
+      "cart": {
+        "lines": [
+          {
+            "id": "gid://shopify/CartLine/1",
+            "quantity": 1,
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "id": "gid://shopify/ProductVariant/1",
+              "product": {
+                "pfand": {
+                  "jsonValue": { "amount": "0.15", "currency_code": "EUR" }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "shop": {
+        "depositTiers": {
+          "jsonValue": [
+            { "amount": 8, "currency": "EUR", "variantId": "gid://shopify/ProductVariant/998" },
+            { "amount": 15, "currency": "EUR", "variantId": "gid://shopify/ProductVariant/999" },
+            { "amount": 29, "currency": "EUR", "variantId": "gid://shopify/ProductVariant/997" }
+          ]
+        }
+      }
+    },
+    "output": {
+      "operations": [
+        {
+          "lineExpand": {
+            "cartLineId": "gid://shopify/CartLine/1",
+            "expandedCartItems": [
+              {
+                "merchandiseId": "gid://shopify/ProductVariant/1",
+                "quantity": 1
+              },
+              {
+                "merchandiseId": "gid://shopify/ProductVariant/999",
+                "quantity": 1
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

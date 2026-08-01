@@ -1,0 +1,110 @@
+{
+  "payload": {
+    "export": "cart-transform-run",
+    "target": "cart.transform.run",
+    "input": {
+      "cart": {
+        "lines": [
+          {
+            "id": "gid://shopify/CartLine/1",
+            "quantity": 1,
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "id": "gid://shopify/ProductVariant/1",
+              "product": {
+                "pfand": {
+                  "jsonValue": { "amount": "0.08", "currency_code": "EUR" }
+                }
+              }
+            }
+          },
+          {
+            "id": "gid://shopify/CartLine/2",
+            "quantity": 1,
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "id": "gid://shopify/ProductVariant/2",
+              "product": {
+                "pfand": null
+              }
+            }
+          },
+          {
+            "id": "gid://shopify/CartLine/3",
+            "quantity": 1,
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "id": "gid://shopify/ProductVariant/3",
+              "product": {
+                "pfand": {
+                  "jsonValue": { "amount": "0.25", "currency_code": "EUR" }
+                }
+              }
+            }
+          },
+          {
+            "id": "gid://shopify/CartLine/4",
+            "quantity": 1,
+            "merchandise": {
+              "__typename": "CustomProduct"
+            }
+          },
+          {
+            "id": "gid://shopify/CartLine/5",
+            "quantity": 1,
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "id": "gid://shopify/ProductVariant/5",
+              "product": {
+                "pfand": {
+                  "jsonValue": { "amount": "0.08", "currency_code": "EUR" }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "shop": {
+        "depositTiers": {
+          "jsonValue": [
+            { "amount": 8, "currency": "EUR", "variantId": "gid://shopify/ProductVariant/999" }
+          ]
+        }
+      }
+    },
+    "output": {
+      "operations": [
+        {
+          "lineExpand": {
+            "cartLineId": "gid://shopify/CartLine/1",
+            "expandedCartItems": [
+              {
+                "merchandiseId": "gid://shopify/ProductVariant/1",
+                "quantity": 1
+              },
+              {
+                "merchandiseId": "gid://shopify/ProductVariant/999",
+                "quantity": 1
+              }
+            ]
+          }
+        },
+        {
+          "lineExpand": {
+            "cartLineId": "gid://shopify/CartLine/5",
+            "expandedCartItems": [
+              {
+                "merchandiseId": "gid://shopify/ProductVariant/5",
+                "quantity": 1
+              },
+              {
+                "merchandiseId": "gid://shopify/ProductVariant/999",
+                "quantity": 1
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "payload": {
+    "export": "cart-validations-generate-run",
+    "target": "cart.validations.generate.run",
+    "input": {
+      "cart": {
+        "lines": [
+          {
+            "quantity": 1,
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "id": "gid://shopify/ProductVariant/1",
+              "product": {
+                "title": "Imported Bottle",
+                "pfand": {
+                  "jsonValue": { "amount": "0.08", "currency_code": "USD" }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "shop": {
+        "depositTiers": {
+          "jsonValue": [
+            { "amount": 8, "currency": "EUR", "variantId": "gid://shopify/ProductVariant/999" }
+          ]
+        }
+      }
+    },
+    "output": {
+      "operations": [
+        {
+          "validationAdd": {
+            "errors": [
+              {
+                "message": "Imported Bottle's deposit amount is no longer configured - contact the store before checking out.",
+                "target": "$.cart"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

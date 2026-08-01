@@ -1,0 +1,63 @@
+{
+  "payload": {
+    "export": "cart-validations-generate-run",
+    "target": "cart.validations.generate.run",
+    "input": {
+      "cart": {
+        "lines": [
+          {
+            "quantity": 1,
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "id": "gid://shopify/ProductVariant/1",
+              "product": {
+                "title": "Cider Bottle",
+                "pfand": {
+                  "jsonValue": { "amount": "0.25", "currency_code": "EUR" }
+                }
+              }
+            }
+          },
+          {
+            "quantity": 1,
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "id": "gid://shopify/ProductVariant/2",
+              "product": {
+                "title": "Beer Crate",
+                "pfand": {
+                  "jsonValue": { "amount": "0.30", "currency_code": "EUR" }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "shop": {
+        "depositTiers": {
+          "jsonValue": [
+            { "amount": 8, "currency": "EUR", "variantId": "gid://shopify/ProductVariant/999" }
+          ]
+        }
+      }
+    },
+    "output": {
+      "operations": [
+        {
+          "validationAdd": {
+            "errors": [
+              {
+                "message": "Cider Bottle's deposit amount is no longer configured - contact the store before checking out.",
+                "target": "$.cart"
+              },
+              {
+                "message": "Beer Crate's deposit amount is no longer configured - contact the store before checking out.",
+                "target": "$.cart"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}
