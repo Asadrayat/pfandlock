@@ -567,16 +567,66 @@ export async function getMigrationExport(
   ]);
   const { data: transformData } = await transformResponse.json();
 
+  const { products, truncated } = await scanCatalogue(admin);
+
+  const productAssignments: MigrationExport["productAssignments"] = [];
+  for (const product of products) {
+    if (!product.pfand) continue; // no deposit assigned - nothing to carry over
+    productAssignments.push({
+      handle: product.handle,
+      title: product.title,
+      skus: product.skus,
+      // Stored in minor units to match DepositTier, not the metafield's
+      // decimal string - the importer compares against tier amounts.
+      amount: Math.round(parseFloat(product.pfand.amount) * 100),
+      currency: product.pfand.currency_code,
+    });
+  }
+
+  return {
+    version: 1,
+    sourceShop: shop,
+    enforcementActive: transformData.cartTransforms.nodes.length > 0,
+    tiers: tiers.map((tier) => ({
+      amount: tier.amount,
+      currency: tier.currency,
+      label: tier.label,
+      chargeTax: tier.chargeTax,
+    })),
+    productAssignments,
+    truncated,
+  };
+}
+
+interface ScannedProduct {
+  id: string;
+  handle: string;
+  title: string;
+  skus: string[];
+  pfand: { amount: string; currency_code: string } | null;
+}
+
+/**
+ * Walks the entire product catalogue once, capturing the identity fields
+ * migration depends on (handle + SKUs) alongside each product's current
+ * deposit metafield.
+ *
+ * Shared by export and import so the two can't drift: if export matches on
+ * a field import doesn't collect, products silently fail to migrate.
+ */
+async function scanCatalogue(
+  admin: AdminApiContext,
+): Promise<{ products: ScannedProduct[]; truncated: boolean }> {
   interface ProductNode {
+    id: string;
     handle: string;
     title: string;
     pfand?: { jsonValue?: { amount: string; currency_code: string } };
     variants: { nodes: Array<{ sku: string | null }> };
   }
 
-  const productAssignments: MigrationExport["productAssignments"] = [];
+  const products: ScannedProduct[] = [];
   let after: string | null = null;
-  let scanned = 0;
   let truncated = false;
 
   for (;;) {
@@ -586,6 +636,7 @@ export async function getMigrationExport(
           products(first: $first, after: $after) {
             pageInfo { hasNextPage endCursor }
             nodes {
+              id
               handle
               title
               pfand: metafield(namespace: "${PFAND_METAFIELD_NAMESPACE}", key: "${PFAND_METAFIELD_KEY}") {
@@ -602,24 +653,18 @@ export async function getMigrationExport(
     const { data } = await response.json();
 
     for (const node of data.products.nodes as ProductNode[]) {
-      const parsed = node.pfand?.jsonValue;
-      if (!parsed) continue; // no deposit assigned - nothing to carry over
-
-      productAssignments.push({
+      products.push({
+        id: node.id,
         handle: node.handle,
         title: node.title,
         skus: node.variants.nodes
           .map((variant) => variant.sku)
           .filter((sku): sku is string => Boolean(sku)),
-        // Stored in minor units to match DepositTier, not the metafield's
-        // decimal string - the importer compares against tier amounts.
-        amount: Math.round(parseFloat(parsed.amount) * 100),
-        currency: parsed.currency_code,
+        pfand: node.pfand?.jsonValue ?? null,
       });
     }
 
-    scanned += data.products.nodes.length;
-    if (scanned >= MIGRATION_PRODUCT_SCAN_LIMIT) {
+    if (products.length >= MIGRATION_PRODUCT_SCAN_LIMIT) {
       truncated = data.products.pageInfo.hasNextPage;
       break;
     }
@@ -627,18 +672,295 @@ export async function getMigrationExport(
     after = data.products.pageInfo.endCursor;
   }
 
+  return { products, truncated };
+}
+
+const tierKey = (amount: number, currency: string) => `${amount}:${currency}`;
+
+/**
+ * Validates an uploaded configuration file. This is untrusted input - a
+ * merchant can hand-edit or upload anything - so every field is checked
+ * rather than cast, and a bad file fails loudly here instead of producing
+ * a half-applied import later.
+ */
+export function parseMigrationExportFile(raw: string): MigrationExport {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("That file isn't valid JSON.");
+  }
+
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new Error("That file doesn't look like a Pfandlock configuration.");
+  }
+  const doc = parsed as Record<string, unknown>;
+
+  if (doc.version !== 1) {
+    throw new Error(
+      `Unsupported configuration version: ${String(doc.version)}. This app reads version 1.`,
+    );
+  }
+  if (!Array.isArray(doc.tiers) || !Array.isArray(doc.productAssignments)) {
+    throw new Error(
+      "That configuration is missing its deposit amounts or product assignments.",
+    );
+  }
+
+  const tiers = doc.tiers.map((entry, index) => {
+    const tier = entry as Record<string, unknown>;
+    if (!Number.isInteger(tier.amount) || (tier.amount as number) <= 0) {
+      throw new Error(`Deposit amount #${index + 1} has an invalid amount.`);
+    }
+    if (typeof tier.currency !== "string" || !tier.currency) {
+      throw new Error(`Deposit amount #${index + 1} has no currency.`);
+    }
+    return {
+      amount: tier.amount as number,
+      currency: tier.currency,
+      label: typeof tier.label === "string" ? tier.label : null,
+      chargeTax: tier.chargeTax === true,
+    };
+  });
+
+  const productAssignments = doc.productAssignments.map((entry, index) => {
+    const product = entry as Record<string, unknown>;
+    if (typeof product.handle !== "string" || !product.handle) {
+      throw new Error(`Product assignment #${index + 1} has no handle.`);
+    }
+    if (!Number.isInteger(product.amount) || (product.amount as number) <= 0) {
+      throw new Error(`Product assignment #${index + 1} has an invalid amount.`);
+    }
+    if (typeof product.currency !== "string" || !product.currency) {
+      throw new Error(`Product assignment #${index + 1} has no currency.`);
+    }
+    return {
+      handle: product.handle,
+      title: typeof product.title === "string" ? product.title : product.handle,
+      skus: Array.isArray(product.skus)
+        ? product.skus.filter((sku): sku is string => typeof sku === "string")
+        : [],
+      amount: product.amount as number,
+      currency: product.currency,
+    };
+  });
+
   return {
     version: 1,
-    sourceShop: shop,
-    enforcementActive: transformData.cartTransforms.nodes.length > 0,
-    tiers: tiers.map((tier) => ({
+    sourceShop: typeof doc.sourceShop === "string" ? doc.sourceShop : "unknown",
+    enforcementActive: doc.enforcementActive === true,
+    tiers,
+    productAssignments,
+    truncated: doc.truncated === true,
+  };
+}
+
+export interface MigrationImportPlan {
+  sourceShop: string;
+  tiersToCreate: Array<{ amount: number; currency: string; label: string | null }>;
+  tiersAlreadyPresent: Array<{ amount: number; currency: string }>;
+  matched: Array<{
+    handle: string;
+    title: string;
+    productId: string;
+    amount: number;
+    currency: string;
+    matchedBy: "sku" | "handle";
+    alreadyCorrect: boolean;
+  }>;
+  unmatched: Array<{ handle: string; title: string }>;
+  /** Matched products whose amount still won't have a tier after import. */
+  missingTier: Array<{ handle: string; title: string; amount: number; currency: string }>;
+  sourceTruncated: boolean;
+  destinationTruncated: boolean;
+}
+
+/**
+ * Works out exactly what an import would do, without changing anything.
+ *
+ * Import is additive by design: it never deletes a tier or clears a deposit
+ * the destination store already has. A store being migrated into may already
+ * be partly configured, and a "restore from file" that silently removed
+ * local work would be far worse than one that leaves a duplicate to resolve
+ * by hand.
+ */
+export async function previewMigrationImport(
+  admin: AdminApiContext,
+  shop: string,
+  data: MigrationExport,
+): Promise<MigrationImportPlan> {
+  const [existingTiers, { products, truncated }] = await Promise.all([
+    listDepositTiers(shop),
+    scanCatalogue(admin),
+  ]);
+
+  const existingTierKeys = new Set(
+    existingTiers.map((tier) => tierKey(tier.amount, tier.currency)),
+  );
+
+  const tiersToCreate = data.tiers.filter(
+    (tier) => !existingTierKeys.has(tierKey(tier.amount, tier.currency)),
+  );
+  const tiersAlreadyPresent = data.tiers.filter((tier) =>
+    existingTierKeys.has(tierKey(tier.amount, tier.currency)),
+  );
+
+  // Index the destination catalogue once rather than querying per product -
+  // a few hundred assignments would otherwise mean a few hundred round trips.
+  const bySku = new Map<string, ScannedProduct>();
+  const byHandle = new Map<string, ScannedProduct>();
+  for (const product of products) {
+    byHandle.set(product.handle, product);
+    for (const sku of product.skus) {
+      if (!bySku.has(sku)) bySku.set(sku, product);
+    }
+  }
+
+  const tierKeysAfterImport = new Set([
+    ...existingTierKeys,
+    ...tiersToCreate.map((tier) => tierKey(tier.amount, tier.currency)),
+  ]);
+
+  const matched: MigrationImportPlan["matched"] = [];
+  const unmatched: MigrationImportPlan["unmatched"] = [];
+  const missingTier: MigrationImportPlan["missingTier"] = [];
+
+  for (const assignment of data.productAssignments) {
+    // SKU first: handles are editable per store, SKUs are the stable
+    // cross-store identifier a merchant actually maintains.
+    let match: ScannedProduct | undefined;
+    let matchedBy: "sku" | "handle" = "sku";
+    for (const sku of assignment.skus) {
+      const candidate = bySku.get(sku);
+      if (candidate) {
+        match = candidate;
+        break;
+      }
+    }
+    if (!match) {
+      match = byHandle.get(assignment.handle);
+      matchedBy = "handle";
+    }
+
+    if (!match) {
+      unmatched.push({ handle: assignment.handle, title: assignment.title });
+      continue;
+    }
+
+    const currentAmount = match.pfand
+      ? Math.round(parseFloat(match.pfand.amount) * 100)
+      : null;
+
+    matched.push({
+      handle: assignment.handle,
+      title: match.title,
+      productId: match.id,
+      amount: assignment.amount,
+      currency: assignment.currency,
+      matchedBy,
+      alreadyCorrect:
+        currentAmount === assignment.amount &&
+        match.pfand?.currency_code === assignment.currency,
+    });
+
+    if (!tierKeysAfterImport.has(tierKey(assignment.amount, assignment.currency))) {
+      missingTier.push({
+        handle: assignment.handle,
+        title: match.title,
+        amount: assignment.amount,
+        currency: assignment.currency,
+      });
+    }
+  }
+
+  return {
+    sourceShop: data.sourceShop,
+    tiersToCreate,
+    tiersAlreadyPresent: tiersAlreadyPresent.map((tier) => ({
       amount: tier.amount,
       currency: tier.currency,
-      label: tier.label,
-      chargeTax: tier.chargeTax,
     })),
-    productAssignments,
-    truncated,
+    matched,
+    unmatched,
+    missingTier,
+    sourceTruncated: data.truncated,
+    destinationTruncated: truncated,
+  };
+}
+
+export interface MigrationImportResult {
+  tiersCreated: number;
+  productsAssigned: number;
+  productsSkipped: number;
+  unmatched: number;
+}
+
+/** How many metafields `metafieldsSet` accepts in one call. */
+const METAFIELDS_SET_BATCH_SIZE = 25;
+
+/**
+ * Applies an import plan. Re-previews first rather than trusting a plan
+ * round-tripped through the browser, so what gets written is always derived
+ * from the store's current state, not from whatever the client posted back.
+ */
+export async function applyMigrationImport(
+  admin: AdminApiContext,
+  shop: string,
+  data: MigrationExport,
+): Promise<MigrationImportResult> {
+  const plan = await previewMigrationImport(admin, shop, data);
+
+  // Sequential, not parallel: each createDepositTier re-sends the deposit
+  // product's whole variant list via productSet, so concurrent calls would
+  // race and drop each other's variants.
+  for (const tier of plan.tiersToCreate) {
+    await createDepositTier(admin, shop, {
+      amount: tier.amount,
+      currency: tier.currency,
+      label: tier.label ?? undefined,
+    });
+  }
+
+  const toAssign = plan.matched.filter((product) => !product.alreadyCorrect);
+
+  for (let i = 0; i < toAssign.length; i += METAFIELDS_SET_BATCH_SIZE) {
+    const batch = toAssign.slice(i, i + METAFIELDS_SET_BATCH_SIZE);
+    const response = await admin.graphql(
+      `#graphql
+        mutation importSetDeposits($metafields: [MetafieldsSetInput!]!) {
+          metafieldsSet(metafields: $metafields) {
+            userErrors { field message }
+          }
+        }`,
+      {
+        variables: {
+          metafields: batch.map((product) => ({
+            ownerId: product.productId,
+            namespace: PFAND_METAFIELD_NAMESPACE,
+            key: PFAND_METAFIELD_KEY,
+            type: "money",
+            value: JSON.stringify({
+              amount: (product.amount / 100).toFixed(2),
+              currency_code: product.currency,
+            }),
+          })),
+        },
+      },
+    );
+    const { data: batchData } = await response.json();
+    const userErrors = batchData?.metafieldsSet?.userErrors ?? [];
+    if (userErrors.length > 0) {
+      throw new Error(
+        `Failed to assign deposits: ${userErrors.map((e: { message: string }) => e.message).join(", ")}`,
+      );
+    }
+  }
+
+  return {
+    tiersCreated: plan.tiersToCreate.length,
+    productsAssigned: toAssign.length,
+    productsSkipped: plan.matched.length - toAssign.length,
+    unmatched: plan.unmatched.length,
   };
 }
 
