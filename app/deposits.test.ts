@@ -29,6 +29,7 @@ import {
   getOnboardingStatus,
   getProductDepositDetail,
   idFromGid,
+  listProductsWithDepositStatus,
   parseMigrationExportFile,
   previewMigrationImport,
   resolveDepositStatus,
@@ -2586,5 +2587,180 @@ describe("getProductDepositDetail", () => {
     const detail = await getProductDepositDetail(store.admin, SHOP, PRODUCT);
 
     expect(detail?.status).toEqual({ state: "no-deposit" });
+  });
+});
+
+describe("listProductsWithDepositStatus", () => {
+  interface ListedProduct {
+    id?: string;
+    title?: string;
+    productType?: string;
+    variantCount?: number;
+    /** Left undefined for a product with no image at all. */
+    featuredMedia?: { preview?: { image?: { url: string } } } | null;
+    price?: { amount: string; currencyCode: string };
+    pfand?: { amount: string; currency_code: string } | null;
+  }
+
+  const fakeCatalogue = (options: {
+    tiers?: Array<ReturnType<typeof tierRow>>;
+    products?: ListedProduct[];
+  } = {}) => {
+    findMany.mockResolvedValue(options.tiers ?? []);
+
+    const queryVariables: Array<Record<string, unknown>> = [];
+    const graphql = vi.fn(
+      async (query: string, init?: { variables?: Record<string, unknown> }) => {
+        if (!query.includes("query productsWithDeposit")) {
+          throw new Error(`fakeCatalogue got an unexpected operation:\n${query}`);
+        }
+        queryVariables.push(init?.variables ?? {});
+
+        return {
+          json: async () => ({
+            data: {
+              products: {
+                nodes: (options.products ?? []).map((product, index) => ({
+                  id: product.id ?? `gid://shopify/Product/${index + 1}`,
+                  title: product.title ?? `Product ${index + 1}`,
+                  productType: product.productType ?? "Drinks",
+                  featuredMedia: product.featuredMedia ?? null,
+                  variantsCount: { count: product.variantCount ?? 1 },
+                  priceRangeV2: {
+                    minVariantPrice: product.price ?? {
+                      amount: "1.99",
+                      currencyCode: "EUR",
+                    },
+                  },
+                  pfand: product.pfand ? { jsonValue: product.pfand } : null,
+                })),
+              },
+            },
+          }),
+        };
+      },
+    );
+
+    return { admin: { graphql } as unknown as AdminApiContext, graphql, queryVariables };
+  };
+
+  it("asks for a page of 25 by default", async () => {
+    const store = fakeCatalogue();
+
+    await listProductsWithDepositStatus(store.admin, SHOP);
+
+    expect(store.queryVariables).toEqual([{ first: 25 }]);
+  });
+
+  it("honours an explicit page size", async () => {
+    // The dashboard asks for 250; the list page takes the default.
+    const store = fakeCatalogue();
+
+    await listProductsWithDepositStatus(store.admin, SHOP, { first: 250 });
+
+    expect(store.queryVariables).toEqual([{ first: 250 }]);
+  });
+
+  it("maps the fields the product list renders", async () => {
+    const store = fakeCatalogue({
+      products: [
+        {
+          id: "gid://shopify/Product/1",
+          title: "Sparkling Water",
+          productType: "Drinks",
+          variantCount: 4,
+          featuredMedia: { preview: { image: { url: "https://cdn/water.jpg" } } },
+          price: { amount: "1.99", currencyCode: "EUR" },
+        },
+      ],
+    });
+
+    const products = await listProductsWithDepositStatus(store.admin, SHOP);
+
+    expect(products).toEqual([
+      {
+        id: "gid://shopify/Product/1",
+        title: "Sparkling Water",
+        productType: "Drinks",
+        totalVariants: 4,
+        imageUrl: "https://cdn/water.jpg",
+        price: "1.99",
+        currencyCode: "EUR",
+        status: { state: "no-deposit" },
+      },
+    ]);
+  });
+
+  it("keeps the product price as the decimal string Shopify sent", async () => {
+    // Everything else in this module is minor units, so converting this one
+    // too would be an easy mistake - but it's the product's own price,
+    // rendered straight, not an amount we ever compare against a tier.
+    const store = fakeCatalogue({
+      products: [{ price: { amount: "12.50", currencyCode: "EUR" } }],
+    });
+
+    const products = await listProductsWithDepositStatus(store.admin, SHOP);
+
+    expect(products[0].price).toBe("12.50");
+  });
+
+  it("falls back to no image at each level of the media chain", async () => {
+    // featuredMedia, its preview and that preview's image are each
+    // independently absent in real responses.
+    const store = fakeCatalogue({
+      products: [
+        { featuredMedia: null },
+        { featuredMedia: {} },
+        { featuredMedia: { preview: {} } },
+        { featuredMedia: { preview: { image: { url: "https://cdn/ok.jpg" } } } },
+      ],
+    });
+
+    const products = await listProductsWithDepositStatus(store.admin, SHOP);
+
+    expect(products.map((product) => product.imageUrl)).toEqual([
+      null,
+      null,
+      null,
+      "https://cdn/ok.jpg",
+    ]);
+  });
+
+  it("resolves each product's deposit status against the shop's tiers", async () => {
+    const store = fakeCatalogue({
+      tiers: [tierRow(8, { label: "Bottle" })],
+      products: [
+        { pfand: { amount: "0.08", currency_code: "EUR" } },
+        { pfand: { amount: "0.25", currency_code: "EUR" } },
+        {},
+      ],
+    });
+
+    const products = await listProductsWithDepositStatus(store.admin, SHOP);
+
+    expect(products.map((product) => product.status.state)).toEqual([
+      "attaching",
+      "orphaned",
+      "no-deposit",
+    ]);
+  });
+
+  it("translates the metafield's currency_code before matching", async () => {
+    // Same hand-written rename as the detail query, same silent failure if
+    // it drifts: no tier matches and everything reads orphaned.
+    const store = fakeCatalogue({
+      tiers: [tierRow(800, { currency: "USD" })],
+      products: [{ pfand: { amount: "8.00", currency_code: "USD" } }],
+    });
+
+    const products = await listProductsWithDepositStatus(store.admin, SHOP);
+
+    expect(products[0].status.state).toBe("attaching");
+  });
+
+  it("returns nothing for an empty catalogue", async () => {
+    const store = fakeCatalogue({ products: [] });
+
+    expect(await listProductsWithDepositStatus(store.admin, SHOP)).toEqual([]);
   });
 });
