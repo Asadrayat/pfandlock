@@ -29,6 +29,7 @@ import {
   parseMigrationExportFile,
   previewMigrationImport,
   resolveDepositStatus,
+  syncDepositTiersMetafield,
   type MigrationExport,
 } from "./deposits.server";
 import { formatRelativeTime } from "./deposits.shared";
@@ -1874,5 +1875,142 @@ describe("createDepositTier", () => {
 
     // Nothing recorded locally that Shopify doesn't have.
     expect(createTierRow).not.toHaveBeenCalled();
+  });
+});
+
+describe("syncDepositTiersMetafield", () => {
+  const fakeShopMetafield = (options: {
+    tiers?: Array<ReturnType<typeof tierRow>>;
+    userErrors?: Array<{ message: string }>;
+  } = {}) => {
+    findMany.mockResolvedValue(options.tiers ?? []);
+
+    const syncedMetafields: Array<Record<string, unknown>> = [];
+    const graphql = vi.fn(
+      async (query: string, init?: { variables?: Record<string, unknown> }) => {
+        const reply = (data: unknown) => ({ json: async () => ({ data }) });
+
+        if (query.includes("query shopId")) {
+          return reply({ shop: { id: "gid://shopify/Shop/1" } });
+        }
+
+        if (query.includes("mutation syncDepositTiers")) {
+          syncedMetafields.push(
+            ...(init?.variables?.metafields as Array<Record<string, unknown>>),
+          );
+          return reply({
+            metafieldsSet: { userErrors: options.userErrors ?? [] },
+          });
+        }
+
+        throw new Error(`fakeShopMetafield got an unexpected operation:\n${query}`);
+      },
+    );
+
+    return { admin: { graphql } as unknown as AdminApiContext, graphql, syncedMetafields };
+  };
+
+  /** The value written, parsed back out of the metafield payload. */
+  const syncedTiers = (metafields: Array<Record<string, unknown>>) =>
+    JSON.parse(metafields[0].value as string);
+
+  it("writes the amount to variant mapping the Functions need", async () => {
+    const store = fakeShopMetafield({
+      tiers: [tierRow(8, { variantId: "gid://shopify/ProductVariant/8" })],
+    });
+
+    await syncDepositTiersMetafield(store.admin, SHOP);
+
+    expect(store.syncedMetafields).toEqual([
+      {
+        // The Shop GID from the query, not the myshopify domain.
+        ownerId: "gid://shopify/Shop/1",
+        namespace: "$app",
+        key: "deposit_tiers",
+        type: "json",
+        value: JSON.stringify([
+          {
+            amount: 8,
+            currency: "EUR",
+            variantId: "gid://shopify/ProductVariant/8",
+          },
+        ]),
+      },
+    ]);
+  });
+
+  it("sends only the three fields the Functions read", async () => {
+    // The sandboxed Functions parse this by shape. Labels and tax flags are
+    // merchant-facing metadata that has no business crossing over.
+    const store = fakeShopMetafield({
+      tiers: [tierRow(8, { label: "Bottle", variantId: "gid://shopify/ProductVariant/8" })],
+    });
+
+    await syncDepositTiersMetafield(store.admin, SHOP);
+
+    expect(Object.keys(syncedTiers(store.syncedMetafields)[0])).toEqual([
+      "amount",
+      "currency",
+      "variantId",
+    ]);
+  });
+
+  it("preserves the order the tiers came back in", async () => {
+    const store = fakeShopMetafield({
+      tiers: [tierRow(8), tierRow(15), tierRow(29)],
+    });
+
+    await syncDepositTiersMetafield(store.admin, SHOP);
+
+    expect(syncedTiers(store.syncedMetafields).map((tier: { amount: number }) => tier.amount)).toEqual([
+      8, 15, 29,
+    ]);
+  });
+
+  it("writes an empty list rather than skipping the sync", async () => {
+    // If the last tier is removed, the metafield has to be emptied. Leaving
+    // the previous value behind would keep the Functions charging for tiers
+    // the merchant has deleted.
+    const store = fakeShopMetafield({ tiers: [] });
+
+    await syncDepositTiersMetafield(store.admin, SHOP);
+
+    expect(store.syncedMetafields).toHaveLength(1);
+    expect(syncedTiers(store.syncedMetafields)).toEqual([]);
+  });
+
+  it("reads only active tiers, cheapest first", async () => {
+    // A soft-disabled tier leaking into this metafield is a tier the
+    // Functions would go on charging for after the merchant retired it.
+    const store = fakeShopMetafield();
+
+    await syncDepositTiersMetafield(store.admin, SHOP);
+
+    expect(findMany).toHaveBeenCalledWith({
+      where: { shop: SHOP, active: true },
+      orderBy: { amount: "asc" },
+    });
+  });
+
+  it("surfaces the reason the metafield was rejected", async () => {
+    const store = fakeShopMetafield({
+      tiers: [tierRow(8)],
+      userErrors: [{ message: "Value is invalid JSON" }],
+    });
+
+    await expect(syncDepositTiersMetafield(store.admin, SHOP)).rejects.toThrow(
+      "Failed to sync deposit tiers metafield: Value is invalid JSON",
+    );
+  });
+
+  it("reports every rejection, not just the first", async () => {
+    const store = fakeShopMetafield({
+      tiers: [tierRow(8)],
+      userErrors: [{ message: "Owner does not exist" }, { message: "Type mismatch" }],
+    });
+
+    await expect(syncDepositTiersMetafield(store.admin, SHOP)).rejects.toThrow(
+      "Failed to sync deposit tiers metafield: Owner does not exist, Type mismatch",
+    );
   });
 });
