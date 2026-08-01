@@ -23,6 +23,7 @@ import {
   applyMigrationImport,
   formatAmount,
   getMigrationExport,
+  getOnboardingStatus,
   idFromGid,
   parseMigrationExportFile,
   previewMigrationImport,
@@ -78,7 +79,10 @@ const tierRow = (
 };
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  // reset, not clear: clearAllMocks wipes recorded calls but leaves any
+  // mockImplementation in place, so a fake store built in one suite would
+  // still be answering queries in the next one.
+  vi.resetAllMocks();
 });
 
 interface CatalogueProduct {
@@ -1332,5 +1336,232 @@ describe("getMigrationExport", () => {
     const reparsed = parseMigrationExportFile(JSON.stringify(data, null, 2));
 
     expect(reparsed).toEqual(data);
+  });
+});
+
+describe("getOnboardingStatus", () => {
+  interface FakeShopOptions {
+    tiers?: Array<ReturnType<typeof tierRow>>;
+    /** What ShopConfig has stored, which may point at a deleted product. */
+    depositProductId?: string | null;
+    /** null models the stored id no longer resolving to a product. */
+    product?: { id: string; title: string; variantCount: number } | null;
+    pfandFieldDefined?: boolean;
+    cartTransformActive?: boolean;
+    plan?: { publicDisplayName: string; shopifyPlus: boolean; partnerDevelopment: boolean };
+    primaryDomainUrl?: string | null;
+  }
+
+  const fakeShop = (options: FakeShopOptions = {}) => {
+    findMany.mockResolvedValue(options.tiers ?? []);
+    findShopConfig.mockResolvedValue(
+      options.depositProductId
+        ? {
+            shop: SHOP,
+            depositProductId: options.depositProductId,
+            createdAt: new Date("2026-01-01T00:00:00Z"),
+            updatedAt: new Date("2026-01-01T00:00:00Z"),
+          }
+        : null,
+    );
+
+    const operations: string[] = [];
+    const graphql = vi.fn(async (query: string) => {
+      const reply = (data: unknown) => ({ json: async () => ({ data }) });
+
+      if (query.includes("query onboardingPfandField")) {
+        operations.push("field");
+        return reply({
+          metafieldDefinitions: {
+            nodes: options.pfandFieldDefined ? [{ id: "gid://shopify/MetafieldDefinition/1" }] : [],
+          },
+        });
+      }
+
+      if (query.includes("query onboardingCartTransform")) {
+        operations.push("transform");
+        return reply({
+          cartTransforms: {
+            nodes: options.cartTransformActive ? [{ id: "gid://shopify/CartTransform/1" }] : [],
+          },
+        });
+      }
+
+      if (query.includes("query onboardingShop")) {
+        operations.push("shop");
+        return reply({
+          shop: {
+            myshopifyDomain: "my-store.myshopify.com",
+            primaryDomain:
+              options.primaryDomainUrl === null
+                ? null
+                : { url: options.primaryDomainUrl ?? "https://shop.example.com" },
+            plan: options.plan ?? {
+              publicDisplayName: "Basic",
+              shopifyPlus: false,
+              partnerDevelopment: false,
+            },
+          },
+        });
+      }
+
+      if (query.includes("query onboardingDepositProduct")) {
+        operations.push("product");
+        const product = options.product;
+        return reply({
+          product: product
+            ? {
+                id: product.id,
+                title: product.title,
+                variantsCount: { count: product.variantCount },
+              }
+            : null,
+        });
+      }
+
+      throw new Error(`fakeShop got an unexpected operation:\n${query}`);
+    });
+
+    return { admin: { graphql } as unknown as AdminApiContext, graphql, operations };
+  };
+
+  const setUpProduct = {
+    id: "gid://shopify/Product/deposit",
+    title: "Pfand (Deposit)",
+    variantCount: 2,
+  };
+
+  it("reports a fresh store as nothing done", async () => {
+    const { admin } = fakeShop();
+
+    const status = await getOnboardingStatus(admin, SHOP);
+
+    expect(status.depositProduct).toBeNull();
+    expect(status.pfandFieldDefined).toBe(false);
+    expect(status.tiers).toEqual([]);
+    expect(status.cartTransformActive).toBe(false);
+    expect(status.completedSteps).toBe(0);
+    expect(status.totalSteps).toBe(4);
+  });
+
+  it("reports a fully configured store as done", async () => {
+    const { admin } = fakeShop({
+      tiers: [tierRow(8)],
+      depositProductId: setUpProduct.id,
+      product: setUpProduct,
+      pfandFieldDefined: true,
+      cartTransformActive: true,
+    });
+
+    const status = await getOnboardingStatus(admin, SHOP);
+
+    expect(status.completedSteps).toBe(4);
+    expect(status.depositProduct).toEqual(setUpProduct);
+  });
+
+  it("treats a stored product id that no longer resolves as not done", async () => {
+    // A merchant can delete the deposit product from the admin. The stored
+    // id outlives it, so believing the id alone would leave step 1 stuck on
+    // "done" for a store that has nothing.
+    const { admin } = fakeShop({
+      depositProductId: "gid://shopify/Product/deleted",
+      product: null,
+      pfandFieldDefined: true,
+    });
+
+    const status = await getOnboardingStatus(admin, SHOP);
+
+    expect(status.depositProduct).toBeNull();
+    expect(status.completedSteps).toBe(1);
+  });
+
+  it("doesn't look up a product when none has ever been stored", async () => {
+    const { admin, operations } = fakeShop();
+
+    await getOnboardingStatus(admin, SHOP);
+
+    expect(operations).not.toContain("product");
+  });
+
+  it("reports the pfand field missing when the deploy didn't land", async () => {
+    // Nothing a merchant does completes this step - it comes from
+    // shopify.app.toml - so querying it is the only way a partial deploy
+    // becomes visible instead of silently breaking assignment.
+    const { admin } = fakeShop({ pfandFieldDefined: false });
+
+    const status = await getOnboardingStatus(admin, SHOP);
+
+    expect(status.pfandFieldDefined).toBe(false);
+  });
+
+  it("counts each step independently", async () => {
+    const { admin } = fakeShop({ tiers: [tierRow(8)], cartTransformActive: true });
+
+    const status = await getOnboardingStatus(admin, SHOP);
+
+    // Tiers and enforcement done, product and field not.
+    expect(status.completedSteps).toBe(2);
+  });
+
+  it("exposes only the tier fields the setup page renders", async () => {
+    const { admin } = fakeShop({
+      tiers: [tierRow(8, { label: "Bottle", variantId: "gid://shopify/ProductVariant/9" })],
+    });
+
+    const status = await getOnboardingStatus(admin, SHOP);
+
+    expect(status.tiers).toEqual([
+      { id: "tier-8-EUR", amount: 8, currency: "EUR", label: "Bottle" },
+    ]);
+  });
+
+  it("prefers the primary domain for the storefront link", async () => {
+    const { admin } = fakeShop({ primaryDomainUrl: "https://shop.example.com" });
+
+    const status = await getOnboardingStatus(admin, SHOP);
+
+    expect(status.shop.storefrontUrl).toBe("https://shop.example.com");
+  });
+
+  it("falls back to the myshopify domain when there's no primary one", async () => {
+    // A brand new store has no primary domain yet, and a setup page that
+    // linked to "undefined" would be worse than one linking somewhere dull.
+    const { admin } = fakeShop({ primaryDomainUrl: null });
+
+    const status = await getOnboardingStatus(admin, SHOP);
+
+    expect(status.shop.storefrontUrl).toBe("https://my-store.myshopify.com");
+  });
+
+  it("passes the plan through for the plan-specific guidance", async () => {
+    const { admin } = fakeShop({
+      plan: {
+        publicDisplayName: "Shopify Plus",
+        shopifyPlus: true,
+        partnerDevelopment: false,
+      },
+    });
+
+    const status = await getOnboardingStatus(admin, SHOP);
+
+    expect(status.shop).toMatchObject({
+      plan: "Shopify Plus",
+      isPlus: true,
+      isDevelopment: false,
+    });
+  });
+
+  it("marks a development store as such", async () => {
+    const { admin } = fakeShop({
+      plan: {
+        publicDisplayName: "Developer Preview",
+        shopifyPlus: false,
+        partnerDevelopment: true,
+      },
+    });
+
+    const status = await getOnboardingStatus(admin, SHOP);
+
+    expect(status.shop.isDevelopment).toBe(true);
   });
 });
