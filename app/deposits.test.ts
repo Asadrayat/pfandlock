@@ -29,6 +29,7 @@ import {
   parseMigrationExportFile,
   previewMigrationImport,
   resolveDepositStatus,
+  setProductDeposit,
   syncDepositTiersMetafield,
   type MigrationExport,
 } from "./deposits.server";
@@ -2012,5 +2013,132 @@ describe("syncDepositTiersMetafield", () => {
     await expect(syncDepositTiersMetafield(store.admin, SHOP)).rejects.toThrow(
       "Failed to sync deposit tiers metafield: Owner does not exist, Type mismatch",
     );
+  });
+});
+
+describe("setProductDeposit", () => {
+  const PRODUCT = "gid://shopify/Product/1";
+
+  const fakeProductMetafield = (options: {
+    setErrors?: Array<{ message: string }>;
+    deleteErrors?: Array<{ message: string }>;
+  } = {}) => {
+    const operations: string[] = [];
+    const setPayloads: Array<Record<string, unknown>> = [];
+    const deletePayloads: Array<Record<string, unknown>> = [];
+
+    const graphql = vi.fn(
+      async (query: string, init?: { variables?: Record<string, unknown> }) => {
+        const reply = (data: unknown) => ({ json: async () => ({ data }) });
+        const metafields = (init?.variables?.metafields ?? []) as Array<
+          Record<string, unknown>
+        >;
+
+        if (query.includes("mutation setDeposit")) {
+          operations.push("set");
+          setPayloads.push(...metafields);
+          return reply({
+            metafieldsSet: { userErrors: options.setErrors ?? [] },
+          });
+        }
+
+        if (query.includes("mutation clearDeposit")) {
+          operations.push("delete");
+          deletePayloads.push(...metafields);
+          return reply({
+            metafieldsDelete: { userErrors: options.deleteErrors ?? [] },
+          });
+        }
+
+        throw new Error(`fakeProductMetafield got an unexpected operation:\n${query}`);
+      },
+    );
+
+    return {
+      admin: { graphql } as unknown as AdminApiContext,
+      graphql,
+      operations,
+      setPayloads,
+      deletePayloads,
+    };
+  };
+
+  it("writes the deposit as a money metafield on the product", async () => {
+    const store = fakeProductMetafield();
+
+    await setProductDeposit(store.admin, PRODUCT, { amount: 8, currency: "EUR" });
+
+    expect(store.setPayloads).toEqual([
+      {
+        ownerId: PRODUCT,
+        namespace: "$app",
+        key: "pfand",
+        type: "money",
+        value: JSON.stringify({ amount: "0.08", currency_code: "EUR" }),
+      },
+    ]);
+  });
+
+  it("converts minor units to the decimal string the money type wants", async () => {
+    const store = fakeProductMetafield();
+
+    await setProductDeposit(store.admin, PRODUCT, { amount: 1500, currency: "EUR" });
+
+    expect(JSON.parse(store.setPayloads[0].value as string).amount).toBe("15.00");
+  });
+
+  it("keeps the tier's own currency", async () => {
+    const store = fakeProductMetafield();
+
+    await setProductDeposit(store.admin, PRODUCT, { amount: 800, currency: "USD" });
+
+    expect(JSON.parse(store.setPayloads[0].value as string)).toEqual({
+      amount: "8.00",
+      currency_code: "USD",
+    });
+  });
+
+  it("deletes the metafield to clear a deposit rather than zeroing it", async () => {
+    // "No deposit" and "a deposit of zero" are different states: a zero
+    // would still read as an assignment, and resolveDepositStatus would
+    // report it orphaned against a tier list that has no 0 amount.
+    const store = fakeProductMetafield();
+
+    await setProductDeposit(store.admin, PRODUCT, null);
+
+    expect(store.operations).toEqual(["delete"]);
+    expect(store.deletePayloads).toEqual([
+      { ownerId: PRODUCT, namespace: "$app", key: "pfand" },
+    ]);
+  });
+
+  it("surfaces why a deposit couldn't be assigned", async () => {
+    const store = fakeProductMetafield({
+      setErrors: [{ message: "Owner does not exist" }],
+    });
+
+    await expect(
+      setProductDeposit(store.admin, PRODUCT, { amount: 8, currency: "EUR" }),
+    ).rejects.toThrow("Owner does not exist");
+  });
+
+  it("surfaces why a deposit couldn't be cleared", async () => {
+    const store = fakeProductMetafield({
+      deleteErrors: [{ message: "Metafield does not exist" }],
+    });
+
+    await expect(setProductDeposit(store.admin, PRODUCT, null)).rejects.toThrow(
+      "Metafield does not exist",
+    );
+  });
+
+  it("reports every rejection, not just the first", async () => {
+    const store = fakeProductMetafield({
+      setErrors: [{ message: "Owner does not exist" }, { message: "Type mismatch" }],
+    });
+
+    await expect(
+      setProductDeposit(store.admin, PRODUCT, { amount: 8, currency: "EUR" }),
+    ).rejects.toThrow("Owner does not exist, Type mismatch");
   });
 });
