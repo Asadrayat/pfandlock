@@ -3,7 +3,7 @@
 // that touches Prisma or the Shopify admin API belongs in deposits.server.ts
 // instead.
 
-/** Formats a minor-unit (cents) amount as a display string, e.g. 8 -> "€0.08". */
+/** Formats a minor-unit (cents) amount as a display string, e.g. 8 -> "0,08 €". */
 export function formatAmount(amount: number, currency: string = "EUR") {
   return new Intl.NumberFormat("de-DE", {
     style: "currency",
