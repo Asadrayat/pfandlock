@@ -12,11 +12,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdminApiContext } from "@shopify/shopify-app-react-router/server";
 
 vi.mock("./db.server", () => ({
-  default: { depositTier: { findMany: vi.fn() } },
+  default: {
+    depositTier: { findMany: vi.fn(), create: vi.fn() },
+    shopConfig: { findUnique: vi.fn(), upsert: vi.fn() },
+  },
 }));
 
 import prisma from "./db.server";
 import {
+  applyMigrationImport,
   formatAmount,
   idFromGid,
   parseMigrationExportFile,
@@ -27,9 +31,91 @@ import {
 import { formatRelativeTime } from "./deposits.shared";
 
 const findMany = vi.mocked(prisma.depositTier.findMany);
+const createTierRow = vi.mocked(prisma.depositTier.create);
+const findShopConfig = vi.mocked(prisma.shopConfig.findUnique);
+const upsertShopConfig = vi.mocked(prisma.shopConfig.upsert);
+
+const SHOP = "new.myshopify.com";
+
+/**
+ * Prisma's methods return a PrismaPromise - an ordinary promise branded with
+ * a toStringTag so its fluent API can be typed. `mockResolvedValue` handles
+ * that for us, but a mock that has to compute its answer needs to hand back
+ * the branded shape itself. Nothing here behaves differently at runtime.
+ */
+const prismaResult = <T>(value: T) => {
+  const promise = Promise.resolve(value);
+  // defineProperty, not assignment: Symbol.toStringTag is inherited from
+  // Promise.prototype as a non-writable property, so a plain set throws.
+  Object.defineProperty(promise, Symbol.toStringTag, { value: "PrismaPromise" });
+  return promise as Promise<T> & { readonly [Symbol.toStringTag]: "PrismaPromise" };
+};
+
+/**
+ * A full DepositTier row from just the fields a test cares about. The code
+ * under test reads a handful of them, but the mocks have to satisfy Prisma's
+ * real return type, and spelling the rest out at each call site would bury
+ * what the test is actually varying.
+ */
+const tierRow = (
+  amount: number,
+  overrides: { currency?: string; label?: string | null; variantId?: string } = {},
+) => {
+  const currency = overrides.currency ?? "EUR";
+  return {
+    id: `tier-${amount}-${currency}`,
+    shop: SHOP,
+    amount,
+    currency,
+    label: overrides.label ?? null,
+    variantId: overrides.variantId ?? `gid://shopify/ProductVariant/tier-${amount}`,
+    chargeTax: false,
+    active: true,
+    createdAt: new Date("2026-01-01T00:00:00Z"),
+    updatedAt: new Date("2026-01-01T00:00:00Z"),
+  };
+};
 
 beforeEach(() => {
   vi.clearAllMocks();
+});
+
+interface CatalogueProduct {
+  id: string;
+  handle: string;
+  title: string;
+  skus?: string[];
+  pfand?: { amount: string; currency_code: string } | null;
+}
+
+/** One product as the migration catalogue query returns it. */
+const catalogueNode = (product: CatalogueProduct) => ({
+  id: product.id,
+  handle: product.handle,
+  title: product.title,
+  pfand: product.pfand ? { jsonValue: product.pfand } : null,
+  variants: { nodes: (product.skus ?? []).map((sku) => ({ sku })) },
+});
+
+const file = (overrides: Partial<MigrationExport> = {}): MigrationExport => ({
+  version: 1,
+  sourceShop: "old-store.myshopify.com",
+  enforcementActive: true,
+  tiers: [{ amount: 8, currency: "EUR", label: "Bottle", chargeTax: false }],
+  productAssignments: [],
+  truncated: false,
+  ...overrides,
+});
+
+const assignment = (
+  overrides: Partial<MigrationExport["productAssignments"][number]> = {},
+) => ({
+  handle: "sparkling-water",
+  title: "Sparkling Water",
+  skus: ["SKU-1"],
+  amount: 8,
+  currency: "EUR",
+  ...overrides,
 });
 
 /**
@@ -259,24 +345,10 @@ describe("parseMigrationExportFile", () => {
 });
 
 describe("previewMigrationImport", () => {
-  interface FakeProduct {
-    id: string;
-    handle: string;
-    title: string;
-    skus?: string[];
-    pfand?: { amount: string; currency_code: string } | null;
-  }
-
-  const node = (product: FakeProduct) => ({
-    id: product.id,
-    handle: product.handle,
-    title: product.title,
-    pfand: product.pfand ? { jsonValue: product.pfand } : null,
-    variants: { nodes: (product.skus ?? []).map((sku) => ({ sku })) },
-  });
-
   /** An admin client that replays fixed catalogue pages, one per call. */
-  const fakeAdmin = (pages: Array<{ products: FakeProduct[]; hasNextPage?: boolean }>) => {
+  const fakeAdmin = (
+    pages: Array<{ products: CatalogueProduct[]; hasNextPage?: boolean }>,
+  ) => {
     let call = 0;
     const graphql = vi.fn(async () => {
       const page = pages[call++];
@@ -288,7 +360,7 @@ describe("previewMigrationImport", () => {
                 hasNextPage: page.hasNextPage ?? false,
                 endCursor: `cursor-${call}`,
               },
-              nodes: page.products.map(node),
+              nodes: page.products.map(catalogueNode),
             },
           },
         }),
@@ -296,44 +368,6 @@ describe("previewMigrationImport", () => {
     });
     return { admin: { graphql } as unknown as AdminApiContext, graphql };
   };
-
-  const file = (overrides: Partial<MigrationExport> = {}): MigrationExport => ({
-    version: 1,
-    sourceShop: "old-store.myshopify.com",
-    enforcementActive: true,
-    tiers: [{ amount: 8, currency: "EUR", label: "Bottle", chargeTax: false }],
-    productAssignments: [],
-    truncated: false,
-    ...overrides,
-  });
-
-  /**
-   * A full DepositTier row from just the two fields that matter here. The
-   * planner only reads amount and currency, but the mock has to satisfy
-   * Prisma's real return type, and spelling the rest out at each call site
-   * would bury what the test is actually varying.
-   */
-  const tierRow = (amount: number, currency = "EUR") => ({
-    id: `tier-${amount}-${currency}`,
-    shop: "new.myshopify.com",
-    amount,
-    currency,
-    label: null,
-    variantId: `gid://shopify/ProductVariant/${amount}`,
-    chargeTax: false,
-    active: true,
-    createdAt: new Date("2026-01-01T00:00:00Z"),
-    updatedAt: new Date("2026-01-01T00:00:00Z"),
-  });
-
-  const assignment = (overrides: Partial<MigrationExport["productAssignments"][number]> = {}) => ({
-    handle: "sparkling-water",
-    title: "Sparkling Water",
-    skus: ["SKU-1"],
-    amount: 8,
-    currency: "EUR",
-    ...overrides,
-  });
 
   it("prefers a SKU match over a handle match", async () => {
     // Handles get renamed per store; the SKU is what the merchant actually
@@ -607,5 +641,404 @@ describe("previewMigrationImport", () => {
     const plan = await previewMigrationImport(admin, "new.myshopify.com", file());
 
     expect(plan.sourceShop).toBe("old-store.myshopify.com");
+  });
+});
+
+describe("applyMigrationImport", () => {
+  interface FakeStoreOptions {
+    catalogue?: CatalogueProduct[];
+    /** Tiers the destination already has before the import runs. */
+    tiers?: Array<ReturnType<typeof tierRow>>;
+    depositProductId?: string | null;
+    /** userErrors for the productSet mutation that creates a tier. */
+    tierErrors?: Array<{ message: string }>;
+    /** userErrors for the metafieldsSet mutation that assigns deposits. */
+    assignErrors?: Array<{ message: string }>;
+  }
+
+  /**
+   * A stand-in destination store: it answers every operation the import
+   * reaches for, and lets created tiers accumulate in the Prisma mock the
+   * way a real database would.
+   *
+   * The accumulation is the point. createDepositTier re-reads the tier list
+   * on every call and re-sends every existing variant through productSet
+   * (which treats `variants` as the complete list and deletes omissions), so
+   * a fake that returned a fixed list would hide exactly the bug that
+   * mechanism exists to prevent.
+   */
+  const fakeStore = (options: FakeStoreOptions = {}) => {
+    const tiers = [...(options.tiers ?? [])];
+    /** Operation names in call order, for asserting what runs before what. */
+    const operations: string[] = [];
+    const assignedBatches: Array<Array<Record<string, unknown>>> = [];
+    const productSetVariants: Array<Array<Record<string, unknown>>> = [];
+    let depositProductId = options.depositProductId ?? null;
+    let variantSeq = 0;
+
+    const shopConfigRow = () => ({
+      shop: SHOP,
+      depositProductId,
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
+    });
+
+    findMany.mockImplementation(() =>
+      prismaResult([...tiers].sort((a, b) => a.amount - b.amount)),
+    );
+    findShopConfig.mockImplementation(() =>
+      prismaResult(depositProductId ? shopConfigRow() : null),
+    );
+    upsertShopConfig.mockImplementation(() => prismaResult(shopConfigRow()));
+    createTierRow.mockImplementation((args) => {
+      const data = args.data as {
+        amount: number;
+        currency: string;
+        label?: string | null;
+        variantId: string;
+      };
+      const row = tierRow(data.amount, {
+        currency: data.currency,
+        label: data.label ?? null,
+        variantId: data.variantId,
+      });
+      tiers.push(row);
+      return prismaResult(row);
+    });
+
+    const graphql = vi.fn(
+      async (query: string, init?: { variables?: Record<string, unknown> }) => {
+        const variables = init?.variables ?? {};
+        const reply = (data: unknown) => ({ json: async () => ({ data }) });
+
+        if (query.includes("query migrationProducts")) {
+          operations.push("scan");
+          return reply({
+            products: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: (options.catalogue ?? []).map(catalogueNode),
+            },
+          });
+        }
+
+        if (query.includes("mutation upsertDepositProduct")) {
+          operations.push("createTier");
+          const input = variables.input as {
+            variants: Array<{ id?: string; optionValues: Array<{ name: string }> }>;
+          };
+          productSetVariants.push(input.variants);
+          if (options.tierErrors?.length) {
+            return reply({ productSet: { userErrors: options.tierErrors } });
+          }
+          // productSet echoes back the full variant list. Entries without an
+          // id are the new ones, so that's where a fresh GID gets minted -
+          // which is what createDepositTier looks up by option name.
+          depositProductId ??= "gid://shopify/Product/deposit";
+          return reply({
+            productSet: {
+              product: {
+                id: depositProductId,
+                variants: {
+                  nodes: input.variants.map((variant) => ({
+                    id:
+                      variant.id ??
+                      `gid://shopify/ProductVariant/new-${++variantSeq}`,
+                    title: variant.optionValues[0].name,
+                  })),
+                },
+              },
+              userErrors: [],
+            },
+          });
+        }
+
+        if (query.includes("query shopId")) {
+          return reply({ shop: { id: "gid://shopify/Shop/1" } });
+        }
+
+        if (query.includes("mutation syncDepositTiers")) {
+          operations.push("syncTiers");
+          return reply({ metafieldsSet: { userErrors: [] } });
+        }
+
+        if (query.includes("mutation importSetDeposits")) {
+          operations.push("assign");
+          assignedBatches.push(
+            variables.metafields as Array<Record<string, unknown>>,
+          );
+          return reply({
+            metafieldsSet: { userErrors: options.assignErrors ?? [] },
+          });
+        }
+
+        throw new Error(`fakeStore got an unexpected operation:\n${query}`);
+      },
+    );
+
+    return {
+      admin: { graphql } as unknown as AdminApiContext,
+      graphql,
+      operations,
+      assignedBatches,
+      productSetVariants,
+      tiers,
+    };
+  };
+
+  /** A destination product that will match `assignment()` by SKU. */
+  const matchingProduct = {
+    id: "gid://shopify/Product/1",
+    handle: "sparkling-water",
+    title: "Sparkling Water",
+    skus: ["SKU-1"],
+  };
+
+  it("creates only the tiers the destination is missing", async () => {
+    const store = fakeStore({ tiers: [tierRow(8)] });
+
+    const result = await applyMigrationImport(
+      store.admin,
+      SHOP,
+      file({
+        tiers: [
+          { amount: 8, currency: "EUR", label: "Bottle", chargeTax: false },
+          { amount: 15, currency: "EUR", label: "Crate", chargeTax: false },
+        ],
+      }),
+    );
+
+    expect(result.tiersCreated).toBe(1);
+    expect(createTierRow).toHaveBeenCalledTimes(1);
+    expect(createTierRow.mock.calls[0][0].data).toMatchObject({
+      amount: 15,
+      currency: "EUR",
+      label: "Crate",
+    });
+  });
+
+  it("re-sends every existing variant when creating the next tier", async () => {
+    // productSet treats `variants` as the complete list, so the second call
+    // must carry the first tier's variant by id or it gets deleted. This is
+    // also why the loop is sequential rather than Promise.all.
+    const store = fakeStore({});
+
+    await applyMigrationImport(
+      store.admin,
+      SHOP,
+      file({
+        tiers: [
+          { amount: 15, currency: "EUR", label: null, chargeTax: false },
+          { amount: 29, currency: "EUR", label: null, chargeTax: false },
+        ],
+      }),
+    );
+
+    expect(store.productSetVariants).toHaveLength(2);
+    expect(store.productSetVariants[0]).toHaveLength(1);
+
+    const second = store.productSetVariants[1];
+    expect(second).toHaveLength(2);
+    // The already-created 15-cent variant is re-sent by id (update in
+    // place); the new 29-cent one has no id yet.
+    expect(second[0].id).toBe("gid://shopify/ProductVariant/new-1");
+    expect(second[1].id).toBeUndefined();
+    expect(second.map((variant) => variant.price)).toEqual(["0.15", "0.29"]);
+  });
+
+  it("creates every tier before assigning any deposit", async () => {
+    // Assigning first would briefly point products at an amount with no
+    // tier behind it - the exact state the validation function blocks
+    // checkout for.
+    const store = fakeStore({ catalogue: [matchingProduct] });
+
+    await applyMigrationImport(
+      store.admin,
+      SHOP,
+      file({ productAssignments: [assignment()] }),
+    );
+
+    expect(store.operations.indexOf("createTier")).toBeLessThan(
+      store.operations.indexOf("assign"),
+    );
+  });
+
+  it("writes the deposit as a decimal money metafield", async () => {
+    const store = fakeStore({
+      tiers: [tierRow(8)],
+      catalogue: [matchingProduct],
+    });
+
+    await applyMigrationImport(
+      store.admin,
+      SHOP,
+      file({ productAssignments: [assignment()] }),
+    );
+
+    expect(store.assignedBatches).toHaveLength(1);
+    expect(store.assignedBatches[0]).toEqual([
+      {
+        ownerId: "gid://shopify/Product/1",
+        namespace: "$app",
+        key: "pfand",
+        type: "money",
+        // Minor units become the two-decimal string the money type wants -
+        // sending 8 here would read back as eight euros.
+        value: JSON.stringify({ amount: "0.08", currency_code: "EUR" }),
+      },
+    ]);
+  });
+
+  it("leaves products that already carry the right deposit alone", async () => {
+    const store = fakeStore({
+      tiers: [tierRow(8)],
+      catalogue: [
+        { ...matchingProduct, pfand: { amount: "0.08", currency_code: "EUR" } },
+      ],
+    });
+
+    const result = await applyMigrationImport(
+      store.admin,
+      SHOP,
+      file({ productAssignments: [assignment()] }),
+    );
+
+    expect(result).toEqual({
+      tiersCreated: 0,
+      productsAssigned: 0,
+      productsSkipped: 1,
+      unmatched: 0,
+    });
+    // No metafield write at all rather than a no-op one: a redundant call
+    // still burns rate limit and bumps the product's updatedAt.
+    expect(store.assignedBatches).toEqual([]);
+  });
+
+  it("batches metafield writes at 25 per call", async () => {
+    const catalogue = Array.from({ length: 26 }, (_, index) => ({
+      id: `gid://shopify/Product/${index}`,
+      handle: `product-${index}`,
+      title: `Product ${index}`,
+    }));
+    const store = fakeStore({ tiers: [tierRow(8)], catalogue });
+
+    const result = await applyMigrationImport(
+      store.admin,
+      SHOP,
+      file({
+        productAssignments: catalogue.map((product) =>
+          assignment({ handle: product.handle, title: product.title, skus: [] }),
+        ),
+      }),
+    );
+
+    expect(store.assignedBatches.map((batch) => batch.length)).toEqual([25, 1]);
+    expect(result.productsAssigned).toBe(26);
+  });
+
+  it("sends exactly one call for a full batch", async () => {
+    const catalogue = Array.from({ length: 25 }, (_, index) => ({
+      id: `gid://shopify/Product/${index}`,
+      handle: `product-${index}`,
+      title: `Product ${index}`,
+    }));
+    const store = fakeStore({ tiers: [tierRow(8)], catalogue });
+
+    await applyMigrationImport(
+      store.admin,
+      SHOP,
+      file({
+        productAssignments: catalogue.map((product) =>
+          assignment({ handle: product.handle, title: product.title, skus: [] }),
+        ),
+      }),
+    );
+
+    expect(store.assignedBatches.map((batch) => batch.length)).toEqual([25]);
+  });
+
+  it("sends no metafield call when nothing matched", async () => {
+    const store = fakeStore({ tiers: [tierRow(8)] });
+
+    const result = await applyMigrationImport(
+      store.admin,
+      SHOP,
+      file({ productAssignments: [assignment()] }),
+    );
+
+    expect(store.assignedBatches).toEqual([]);
+    expect(result).toEqual({
+      tiersCreated: 0,
+      productsAssigned: 0,
+      productsSkipped: 0,
+      unmatched: 1,
+    });
+  });
+
+  it("surfaces the reason a deposit assignment was rejected", async () => {
+    const store = fakeStore({
+      tiers: [tierRow(8)],
+      catalogue: [matchingProduct],
+      assignErrors: [{ message: "Owner does not exist" }],
+    });
+
+    await expect(
+      applyMigrationImport(
+        store.admin,
+        SHOP,
+        file({ productAssignments: [assignment()] }),
+      ),
+    ).rejects.toThrow("Failed to assign deposits: Owner does not exist");
+  });
+
+  it("stops before touching products when a tier can't be created", async () => {
+    const store = fakeStore({
+      catalogue: [matchingProduct],
+      tierErrors: [{ message: "Variant limit reached" }],
+    });
+
+    await expect(
+      applyMigrationImport(
+        store.admin,
+        SHOP,
+        file({ productAssignments: [assignment()] }),
+      ),
+    ).rejects.toThrow("Failed to create deposit tier: Variant limit reached");
+
+    // Better to fail with nothing assigned than to leave products pointing
+    // at an amount whose tier never got made.
+    expect(store.assignedBatches).toEqual([]);
+  });
+
+  it("reports the counts the completion banner reads", async () => {
+    const store = fakeStore({
+      catalogue: [
+        matchingProduct,
+        {
+          id: "gid://shopify/Product/2",
+          handle: "already-set",
+          title: "Already Set",
+          pfand: { amount: "0.08", currency_code: "EUR" },
+        },
+      ],
+    });
+
+    const result = await applyMigrationImport(
+      store.admin,
+      SHOP,
+      file({
+        productAssignments: [
+          assignment(),
+          assignment({ handle: "already-set", title: "Already Set", skus: [] }),
+          assignment({ handle: "missing", title: "Missing", skus: [] }),
+        ],
+      }),
+    );
+
+    expect(result).toEqual({
+      tiersCreated: 1,
+      productsAssigned: 1,
+      productsSkipped: 1,
+      unmatched: 1,
+    });
   });
 });
