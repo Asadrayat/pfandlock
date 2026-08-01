@@ -23,6 +23,7 @@ import {
   applyMigrationImport,
   createDepositTier,
   formatAmount,
+  getDashboardSummary,
   getMigrationExport,
   getOnboardingStatus,
   idFromGid,
@@ -2140,5 +2141,208 @@ describe("setProductDeposit", () => {
     await expect(
       setProductDeposit(store.admin, PRODUCT, { amount: 8, currency: "EUR" }),
     ).rejects.toThrow("Owner does not exist, Type mismatch");
+  });
+});
+
+describe("getDashboardSummary", () => {
+  interface DashboardProduct {
+    id: string;
+    title: string;
+    pfand?: { amount: string; currency_code: string } | null;
+  }
+
+  /** One product as the dashboard's product query returns it. */
+  const dashboardNode = (product: DashboardProduct) => ({
+    id: product.id,
+    title: product.title,
+    productType: "Drinks",
+    featuredMedia: null,
+    variantsCount: { count: 1 },
+    priceRangeV2: { minVariantPrice: { amount: "1.99", currencyCode: "EUR" } },
+    pfand: product.pfand ? { jsonValue: product.pfand } : null,
+  });
+
+  const fakeDashboard = (options: {
+    tiers?: Array<ReturnType<typeof tierRow>>;
+    products?: DashboardProduct[];
+    /** Catalogue size, which can far exceed the page actually scanned. */
+    totalProductCount?: number;
+    cartTransformActive?: boolean;
+  } = {}) => {
+    findMany.mockResolvedValue(options.tiers ?? []);
+
+    const productQueryVariables: Array<Record<string, unknown>> = [];
+    const graphql = vi.fn(
+      async (query: string, init?: { variables?: Record<string, unknown> }) => {
+        const reply = (data: unknown) => ({ json: async () => ({ data }) });
+
+        if (query.includes("query dashboardProductsCount")) {
+          return reply({
+            productsCount: { count: options.totalProductCount ?? 0 },
+          });
+        }
+
+        if (query.includes("query dashboardCartTransformStatus")) {
+          return reply({
+            cartTransforms: {
+              nodes: options.cartTransformActive
+                ? [{ id: "gid://shopify/CartTransform/1" }]
+                : [],
+            },
+          });
+        }
+
+        if (query.includes("query productsWithDeposit")) {
+          productQueryVariables.push(init?.variables ?? {});
+          return reply({
+            products: { nodes: (options.products ?? []).map(dashboardNode) },
+          });
+        }
+
+        throw new Error(`fakeDashboard got an unexpected operation:\n${query}`);
+      },
+    );
+
+    return {
+      admin: { graphql } as unknown as AdminApiContext,
+      graphql,
+      productQueryVariables,
+    };
+  };
+
+  const eur = (amount: string) => ({ amount, currency_code: "EUR" });
+
+  it("counts how many products sit on each tier", async () => {
+    const store = fakeDashboard({
+      tiers: [tierRow(8), tierRow(15)],
+      products: [
+        { id: "gid://shopify/Product/1", title: "A", pfand: eur("0.08") },
+        { id: "gid://shopify/Product/2", title: "B", pfand: eur("0.08") },
+        { id: "gid://shopify/Product/3", title: "C", pfand: eur("0.15") },
+      ],
+    });
+
+    const summary = await getDashboardSummary(store.admin, SHOP);
+
+    expect(summary.tiers).toEqual([
+      { id: "tier-8-EUR", amount: 8, currency: "EUR", label: null, productCount: 2 },
+      { id: "tier-15-EUR", amount: 15, currency: "EUR", label: null, productCount: 1 },
+    ]);
+    expect(summary.attachingCount).toBe(3);
+  });
+
+  it("shows a tier nobody uses as zero rather than omitting it", async () => {
+    // A tier with no products is exactly what a merchant needs to see.
+    const store = fakeDashboard({ tiers: [tierRow(8)] });
+
+    const summary = await getDashboardSummary(store.admin, SHOP);
+
+    expect(summary.tiers).toHaveLength(1);
+    expect(summary.tiers[0].productCount).toBe(0);
+    expect(summary.attachingCount).toBe(0);
+  });
+
+  it("keys tier counts by currency as well as amount", async () => {
+    // An 8 USD product must not be counted against the 8 EUR tier.
+    const store = fakeDashboard({
+      tiers: [tierRow(8)],
+      products: [
+        { id: "gid://shopify/Product/1", title: "Euro", pfand: eur("0.08") },
+        {
+          id: "gid://shopify/Product/2",
+          title: "Dollar",
+          pfand: { amount: "0.08", currency_code: "USD" },
+        },
+      ],
+    });
+
+    const summary = await getDashboardSummary(store.admin, SHOP);
+
+    expect(summary.tiers[0].productCount).toBe(1);
+    // The dollar one has no matching tier, so it's orphaned, not attaching.
+    expect(summary.attachingCount).toBe(1);
+    expect(summary.orphanedProducts).toEqual([
+      {
+        id: "gid://shopify/Product/2",
+        title: "Dollar",
+        amount: 8,
+        currency: "USD",
+      },
+    ]);
+  });
+
+  it("lists products tagged with an amount no tier backs", async () => {
+    // These are the ones that block checkout, so the dashboard names them
+    // rather than just counting them.
+    const store = fakeDashboard({
+      tiers: [tierRow(8)],
+      products: [
+        { id: "gid://shopify/Product/1", title: "Orphan", pfand: eur("0.25") },
+      ],
+    });
+
+    const summary = await getDashboardSummary(store.admin, SHOP);
+
+    expect(summary.orphanedProducts).toEqual([
+      {
+        id: "gid://shopify/Product/1",
+        title: "Orphan",
+        amount: 25,
+        currency: "EUR",
+      },
+    ]);
+    expect(summary.attachingCount).toBe(0);
+  });
+
+  it("ignores products with no deposit in either count", async () => {
+    const store = fakeDashboard({
+      tiers: [tierRow(8)],
+      products: [
+        { id: "gid://shopify/Product/1", title: "Plain" },
+        { id: "gid://shopify/Product/2", title: "Deposited", pfand: eur("0.08") },
+      ],
+    });
+
+    const summary = await getDashboardSummary(store.admin, SHOP);
+
+    expect(summary.attachingCount).toBe(1);
+    expect(summary.orphanedProducts).toEqual([]);
+  });
+
+  it("takes the catalogue total from the count query, not the scanned page", async () => {
+    // Coverage is measured from one page of 250, but "how many products do
+    // I have" has to be the real number or the dashboard understates the
+    // work left to do.
+    const store = fakeDashboard({
+      tiers: [tierRow(8)],
+      products: [
+        { id: "gid://shopify/Product/1", title: "A", pfand: eur("0.08") },
+      ],
+      totalProductCount: 1000,
+    });
+
+    const summary = await getDashboardSummary(store.admin, SHOP);
+
+    expect(summary.totalProductCount).toBe(1000);
+    expect(summary.attachingCount).toBe(1);
+  });
+
+  it("scans a full page of products for the coverage breakdown", async () => {
+    const store = fakeDashboard();
+
+    await getDashboardSummary(store.admin, SHOP);
+
+    expect(store.productQueryVariables).toEqual([{ first: 250 }]);
+  });
+
+  it("reports whether checkout enforcement is on", async () => {
+    const off = await getDashboardSummary(fakeDashboard().admin, SHOP);
+    expect(off.cartTransformActive).toBe(false);
+
+    const on = await getDashboardSummary(
+      fakeDashboard({ cartTransformActive: true }).admin,
+      SHOP,
+    );
+    expect(on.cartTransformActive).toBe(true);
   });
 });
