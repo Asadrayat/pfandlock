@@ -21,6 +21,7 @@ vi.mock("./db.server", () => ({
 import prisma from "./db.server";
 import {
   applyMigrationImport,
+  createDepositTier,
   formatAmount,
   getMigrationExport,
   getOnboardingStatus,
@@ -1563,5 +1564,315 @@ describe("getOnboardingStatus", () => {
     const status = await getOnboardingStatus(admin, SHOP);
 
     expect(status.shop.isDevelopment).toBe(true);
+  });
+});
+
+describe("createDepositTier", () => {
+  interface VariantInput {
+    id?: string;
+    price: string;
+    optionValues: Array<{ optionName: string; name: string }>;
+  }
+
+  interface ProductSetCall {
+    identifier?: { id: string };
+    input: {
+      title: string;
+      status: string;
+      productOptions: Array<{ name: string; position: number; values: Array<{ name: string }> }>;
+      variants: VariantInput[];
+    };
+  }
+
+  /**
+   * The deposit product as Shopify would hold it. productSet echoes back the
+   * variant list it was given, minting ids for entries that arrived without
+   * one - which is how createDepositTier learns the new variant's id.
+   */
+  const fakeDepositProduct = (options: {
+    tiers?: Array<ReturnType<typeof tierRow>>;
+    depositProductId?: string | null;
+    userErrors?: Array<{ message: string }>;
+  } = {}) => {
+    const tiers = [...(options.tiers ?? [])];
+    const productSetCalls: ProductSetCall[] = [];
+    const syncedMetafields: Array<Record<string, unknown>> = [];
+    let depositProductId = options.depositProductId ?? null;
+    let variantSeq = 0;
+
+    findMany.mockImplementation(() =>
+      prismaResult([...tiers].sort((a, b) => a.amount - b.amount)),
+    );
+    findShopConfig.mockImplementation(() =>
+      prismaResult(
+        depositProductId
+          ? {
+              shop: SHOP,
+              depositProductId,
+              createdAt: new Date("2026-01-01T00:00:00Z"),
+              updatedAt: new Date("2026-01-01T00:00:00Z"),
+            }
+          : null,
+      ),
+    );
+    upsertShopConfig.mockImplementation(() =>
+      prismaResult({
+        shop: SHOP,
+        depositProductId,
+        createdAt: new Date("2026-01-01T00:00:00Z"),
+        updatedAt: new Date("2026-01-01T00:00:00Z"),
+      }),
+    );
+    createTierRow.mockImplementation((args) => {
+      const data = args.data as {
+        amount: number;
+        currency: string;
+        label?: string | null;
+        chargeTax?: boolean;
+        variantId: string;
+      };
+      const row = {
+        ...tierRow(data.amount, {
+          currency: data.currency,
+          label: data.label ?? null,
+          variantId: data.variantId,
+        }),
+        chargeTax: data.chargeTax ?? false,
+      };
+      tiers.push(row);
+      return prismaResult(row);
+    });
+
+    const graphql = vi.fn(
+      async (query: string, init?: { variables?: Record<string, unknown> }) => {
+        const reply = (data: unknown) => ({ json: async () => ({ data }) });
+
+        if (query.includes("mutation upsertDepositProduct")) {
+          const call = (init?.variables ?? {}) as unknown as ProductSetCall;
+          productSetCalls.push(call);
+
+          if (options.userErrors?.length) {
+            return reply({ productSet: { userErrors: options.userErrors } });
+          }
+
+          depositProductId ??= "gid://shopify/Product/deposit";
+          return reply({
+            productSet: {
+              product: {
+                id: depositProductId,
+                variants: {
+                  nodes: call.input.variants.map((variant) => ({
+                    id:
+                      variant.id ??
+                      `gid://shopify/ProductVariant/new-${++variantSeq}`,
+                    title: variant.optionValues[0].name,
+                  })),
+                },
+              },
+              userErrors: [],
+            },
+          });
+        }
+
+        if (query.includes("query shopId")) {
+          return reply({ shop: { id: "gid://shopify/Shop/1" } });
+        }
+
+        if (query.includes("mutation syncDepositTiers")) {
+          syncedMetafields.push(
+            ...(init?.variables?.metafields as Array<Record<string, unknown>>),
+          );
+          return reply({ metafieldsSet: { userErrors: [] } });
+        }
+
+        throw new Error(`fakeDepositProduct got an unexpected operation:\n${query}`);
+      },
+    );
+
+    return {
+      admin: { graphql } as unknown as AdminApiContext,
+      graphql,
+      productSetCalls,
+      syncedMetafields,
+      tiers,
+    };
+  };
+
+  it("creates the product on first use rather than updating one", async () => {
+    // Omitting `identifier` is what tells productSet to make a new product.
+    // Sending one that doesn't exist yet would fail instead.
+    const store = fakeDepositProduct();
+
+    await createDepositTier(store.admin, SHOP, { amount: 8 });
+
+    expect(store.productSetCalls[0].identifier).toBeUndefined();
+    expect(store.productSetCalls[0].input).toMatchObject({
+      title: "Pfand (Deposit)",
+      status: "ACTIVE",
+    });
+  });
+
+  it("records the new product id so later tiers update it", async () => {
+    const store = fakeDepositProduct();
+
+    await createDepositTier(store.admin, SHOP, { amount: 8 });
+
+    expect(upsertShopConfig).toHaveBeenCalledTimes(1);
+  });
+
+  it("targets the existing product instead of making a second one", async () => {
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+      tiers: [tierRow(8, { variantId: "gid://shopify/ProductVariant/8" })],
+    });
+
+    await createDepositTier(store.admin, SHOP, { amount: 15 });
+
+    expect(store.productSetCalls[0].identifier).toEqual({
+      id: "gid://shopify/Product/deposit",
+    });
+    // A second deposit product would split tiers across two products and
+    // leave the Functions reading only half of them.
+    expect(upsertShopConfig).not.toHaveBeenCalled();
+  });
+
+  it("re-sends every existing variant by id alongside the new one", async () => {
+    // productSet treats `variants` as the complete list and deletes what's
+    // missing, so anything omitted here is destroyed.
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+      tiers: [
+        tierRow(8, { variantId: "gid://shopify/ProductVariant/8" }),
+        tierRow(15, { variantId: "gid://shopify/ProductVariant/15" }),
+      ],
+    });
+
+    await createDepositTier(store.admin, SHOP, { amount: 29 });
+
+    const { variants, productOptions } = store.productSetCalls[0].input;
+    expect(variants.map((variant) => variant.id)).toEqual([
+      "gid://shopify/ProductVariant/8",
+      "gid://shopify/ProductVariant/15",
+      undefined,
+    ]);
+    // The option value list has to grow in step, or productSet rejects a
+    // variant whose option value isn't declared.
+    expect(productOptions[0].values.map((value) => value.name)).toEqual([
+      formatAmount(8),
+      formatAmount(15),
+      formatAmount(29),
+    ]);
+  });
+
+  it("prices variants as a decimal string, not minor units", async () => {
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+      tiers: [tierRow(8, { variantId: "gid://shopify/ProductVariant/8" })],
+    });
+
+    await createDepositTier(store.admin, SHOP, { amount: 1500 });
+
+    expect(store.productSetCalls[0].input.variants.map((v) => v.price)).toEqual([
+      "0.08",
+      "15.00",
+    ]);
+  });
+
+  it("names the variant option after the formatted amount", async () => {
+    const store = fakeDepositProduct();
+
+    await createDepositTier(store.admin, SHOP, { amount: 8 });
+
+    expect(store.productSetCalls[0].input.variants[0].optionValues).toEqual([
+      { optionName: "Amount", name: formatAmount(8) },
+    ]);
+  });
+
+  it("stores the id of the variant productSet actually created", async () => {
+    // The new variant is identified by its option name in the response.
+    // Storing the wrong id would price every future cart off the wrong
+    // variant, which is invisible until checkout.
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+      tiers: [tierRow(8, { variantId: "gid://shopify/ProductVariant/8" })],
+    });
+
+    const tier = await createDepositTier(store.admin, SHOP, { amount: 29 });
+
+    expect(tier.variantId).toBe("gid://shopify/ProductVariant/new-1");
+    expect(createTierRow.mock.calls[0][0].data).toMatchObject({
+      shop: SHOP,
+      amount: 29,
+      variantId: "gid://shopify/ProductVariant/new-1",
+    });
+  });
+
+  it("defaults currency to EUR and tax to off", async () => {
+    const store = fakeDepositProduct();
+
+    await createDepositTier(store.admin, SHOP, { amount: 8 });
+
+    expect(createTierRow.mock.calls[0][0].data).toMatchObject({
+      currency: "EUR",
+      chargeTax: false,
+    });
+  });
+
+  it("passes an explicit currency, label and tax flag through", async () => {
+    const store = fakeDepositProduct();
+
+    await createDepositTier(store.admin, SHOP, {
+      amount: 800,
+      currency: "USD",
+      label: "Crate",
+      chargeTax: true,
+    });
+
+    expect(createTierRow.mock.calls[0][0].data).toMatchObject({
+      currency: "USD",
+      label: "Crate",
+      chargeTax: true,
+    });
+    expect(store.productSetCalls[0].input.variants[0].optionValues[0].name).toBe(
+      formatAmount(800, "USD"),
+    );
+  });
+
+  it("mirrors the new tier onto the shop metafield the Functions read", async () => {
+    // The Cart Transform and Validation functions can't reach Postgres, so
+    // a tier that exists only in the DB is one they'll never charge for.
+    const store = fakeDepositProduct();
+
+    await createDepositTier(store.admin, SHOP, { amount: 8 });
+
+    expect(store.syncedMetafields).toEqual([
+      {
+        ownerId: "gid://shopify/Shop/1",
+        namespace: "$app",
+        key: "deposit_tiers",
+        type: "json",
+        // Synced after the row is created, so the new tier is included.
+        value: JSON.stringify([
+          {
+            amount: 8,
+            currency: "EUR",
+            variantId: "gid://shopify/ProductVariant/new-1",
+          },
+        ]),
+      },
+    ]);
+  });
+
+  it("surfaces the reason productSet refused", async () => {
+    const store = fakeDepositProduct({
+      userErrors: [{ message: "Option values must be unique" }],
+    });
+
+    await expect(
+      createDepositTier(store.admin, SHOP, { amount: 8 }),
+    ).rejects.toThrow("Failed to create deposit tier: Option values must be unique");
+
+    // Nothing recorded locally that Shopify doesn't have.
+    expect(createTierRow).not.toHaveBeenCalled();
   });
 });
