@@ -23,6 +23,7 @@ import {
   applyMigrationImport,
   createDepositTier,
   formatAmount,
+  getActivitySummary,
   getDashboardSummary,
   getMigrationExport,
   getOnboardingStatus,
@@ -2344,5 +2345,122 @@ describe("getDashboardSummary", () => {
       SHOP,
     );
     expect(on.cartTransformActive).toBe(true);
+  });
+});
+
+describe("getActivitySummary", () => {
+  const at = (iso: string) => new Date(iso);
+
+  /** A tier row with explicit timestamps, which is all this reads. */
+  const timedTier = (
+    amount: number,
+    createdAt: string,
+    updatedAt: string = createdAt,
+    overrides: { currency?: string; label?: string | null } = {},
+  ) => ({
+    ...tierRow(amount, overrides),
+    createdAt: at(createdAt),
+    updatedAt: at(updatedAt),
+  });
+
+  it("reads a tier whose timestamps match as newly added", async () => {
+    findMany.mockResolvedValue([timedTier(8, "2026-03-01T10:00:00Z")]);
+
+    const summary = await getActivitySummary(SHOP);
+
+    expect(summary.events).toEqual([
+      {
+        id: "tier-8-EUR",
+        message: `${formatAmount(8)} amount added`,
+        detail: null,
+        when: at("2026-03-01T10:00:00Z"),
+      },
+    ]);
+  });
+
+  it("reads a tier edited after creation as updated", async () => {
+    // createdAt vs updatedAt is the only thing distinguishing the two, so
+    // an equality check that drifted to `>=` would relabel every new tier.
+    findMany.mockResolvedValue([
+      timedTier(15, "2026-03-01T10:00:00Z", "2026-03-05T09:00:00Z"),
+    ]);
+
+    const summary = await getActivitySummary(SHOP);
+
+    expect(summary.events[0].message).toBe(`${formatAmount(15)} amount updated`);
+    // The edit is the event, so it's dated by the edit.
+    expect(summary.events[0].when).toEqual(at("2026-03-05T09:00:00Z"));
+  });
+
+  it("orders events newest first", async () => {
+    findMany.mockResolvedValue([
+      timedTier(8, "2026-03-01T10:00:00Z"),
+      timedTier(29, "2026-03-09T10:00:00Z"),
+      timedTier(15, "2026-03-01T09:00:00Z", "2026-03-05T09:00:00Z"),
+    ]);
+
+    const summary = await getActivitySummary(SHOP);
+
+    // Sorted on the event date, so the edited 15 sits above the older 8
+    // despite having been created first.
+    expect(summary.events.map((event) => event.when)).toEqual([
+      at("2026-03-09T10:00:00Z"),
+      at("2026-03-05T09:00:00Z"),
+      at("2026-03-01T10:00:00Z"),
+    ]);
+  });
+
+  it("uses the tier label as the event detail", async () => {
+    findMany.mockResolvedValue([
+      timedTier(8, "2026-03-01T10:00:00Z", "2026-03-01T10:00:00Z", {
+        label: "Single-use bottle",
+      }),
+    ]);
+
+    const summary = await getActivitySummary(SHOP);
+
+    expect(summary.events[0].detail).toBe("Single-use bottle");
+  });
+
+  it("formats the amount in the tier's own currency", async () => {
+    findMany.mockResolvedValue([
+      timedTier(800, "2026-03-01T10:00:00Z", "2026-03-01T10:00:00Z", {
+        currency: "USD",
+      }),
+    ]);
+
+    const summary = await getActivitySummary(SHOP);
+
+    expect(summary.events[0].message).toBe(`${formatAmount(800, "USD")} amount added`);
+  });
+
+  it("keeps retired tiers in the history", async () => {
+    // Unlike listDepositTiers, this deliberately doesn't filter on active.
+    // Soft-deleting a tier shouldn't erase the record that it once existed
+    // - that's the whole point of soft-deleting it.
+    findMany.mockResolvedValue([]);
+
+    await getActivitySummary(SHOP);
+
+    expect(findMany).toHaveBeenCalledWith({ where: { shop: SHOP } });
+  });
+
+  it("counts the config changes it found", async () => {
+    findMany.mockResolvedValue([
+      timedTier(8, "2026-03-01T10:00:00Z"),
+      timedTier(15, "2026-03-02T10:00:00Z"),
+    ]);
+
+    const summary = await getActivitySummary(SHOP);
+
+    expect(summary.configChangeCount).toBe(2);
+  });
+
+  it("reports nothing rather than failing on a store with no tiers", async () => {
+    findMany.mockResolvedValue([]);
+
+    const summary = await getActivitySummary(SHOP);
+
+    expect(summary).toEqual({ events: [], configChangeCount: 0 });
   });
 });
