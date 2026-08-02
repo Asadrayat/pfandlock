@@ -1,0 +1,74 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch makes the first run's answer irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Lint, typecheck and test
+    runs-on: ubuntu-latest
+
+    env:
+      # Prisma won't generate a client unless the datasource's env var is set,
+      # but nothing in these gates opens a connection - the suites mock Prisma
+      # outright. This is a placeholder to satisfy that check, not a secret,
+      # and it must never be pointed at a real database: the tests are not
+      # written to be safe against one.
+      DATABASE_URL: postgresql://user:password@localhost:5432/pfandlock
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Before setup-node, so its `cache: pnpm` can find the store.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          # Matches the `engines` range in package.json.
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # The wasm suites shell out to a globally installed `shopify` binary -
+      # `@shopify/shopify-function-test-helpers` runs `shopify app function
+      # build` to compile each function before running fixtures through it.
+      # Pinned to the major the repo was developed against so a CLI release
+      # can't turn a green branch red on its own.
+      - name: Install Shopify CLI
+        run: npm install -g @shopify/cli@4
+
+      # Each extension's `generated/api.ts` is derived from its own committed
+      # schema.graphql and is gitignored, so a fresh checkout has to produce it
+      # before anything can typecheck the extension sources that import it.
+      # Offline and unauthenticated - it reads the local schema, nothing else.
+      - name: Generate function API types
+        run: |
+          shopify app function typegen --path extensions/deposit-cart-transform
+          shopify app function typegen --path extensions/deposit-checkout-validation
+
+      - name: Generate Prisma client
+        run: pnpm exec prisma generate
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Test (app)
+        run: pnpm run test
+
+      # The two function extensions, each of which compiles its source to wasm
+      # and runs the committed fixtures through the real module.
+      - name: Test (functions)
+        run: pnpm run test:extensions

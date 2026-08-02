@@ -8,23 +8,15 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { useFetcher, useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
-
-const CART_TRANSFORM_FUNCTION_HANDLE = "deposit-cart-transform";
+import {
+  CART_TRANSFORM_FUNCTION_HANDLE,
+  isDepositCartTransformActive,
+} from "../deposits.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin } = await authenticate.admin(request);
 
-  const response = await admin.graphql(`#graphql
-    query existingCartTransforms {
-      cartTransforms(first: 1) {
-        nodes {
-          id
-        }
-      }
-    }`);
-  const { data } = await response.json();
-
-  return { enabled: data.cartTransforms.nodes.length > 0 };
+  return { enabled: await isDepositCartTransformActive(admin) };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {

@@ -13,7 +13,7 @@ import type { AdminApiContext } from "@shopify/shopify-app-react-router/server";
 
 vi.mock("./db.server", () => ({
   default: {
-    depositTier: { findMany: vi.fn(), create: vi.fn() },
+    depositTier: { findMany: vi.fn(), create: vi.fn(), updateMany: vi.fn() },
     shopConfig: { findUnique: vi.fn(), upsert: vi.fn() },
   },
 }));
@@ -22,8 +22,11 @@ import prisma from "./db.server";
 import {
   applyMigrationImport,
   createDepositTier,
+  detectSupportedCurrencies,
+  ensureSupportedCurrencies,
   formatAmount,
   getActivitySummary,
+  isDepositCartTransformActive,
   getDashboardSummary,
   getMigrationExport,
   getOnboardingStatus,
@@ -31,8 +34,12 @@ import {
   idFromGid,
   listProductsWithDepositStatus,
   parseMigrationExportFile,
+  listAllDepositTiers,
+  listDepositTiers,
   previewMigrationImport,
+  readSupportedCurrencies,
   resolveDepositStatus,
+  setDepositTierActive,
   setProductDeposit,
   syncDepositTiersMetafield,
   type MigrationExport,
@@ -41,6 +48,7 @@ import { formatRelativeTime } from "./deposits.shared";
 
 const findMany = vi.mocked(prisma.depositTier.findMany);
 const createTierRow = vi.mocked(prisma.depositTier.create);
+const updateTierRows = vi.mocked(prisma.depositTier.updateMany);
 const findShopConfig = vi.mocked(prisma.shopConfig.findUnique);
 const upsertShopConfig = vi.mocked(prisma.shopConfig.upsert);
 
@@ -68,7 +76,12 @@ const prismaResult = <T>(value: T) => {
  */
 const tierRow = (
   amount: number,
-  overrides: { currency?: string; label?: string | null; variantId?: string } = {},
+  overrides: {
+    currency?: string;
+    label?: string | null;
+    variantId?: string;
+    active?: boolean;
+  } = {},
 ) => {
   const currency = overrides.currency ?? "EUR";
   return {
@@ -79,11 +92,93 @@ const tierRow = (
     label: overrides.label ?? null,
     variantId: overrides.variantId ?? `gid://shopify/ProductVariant/tier-${amount}`,
     chargeTax: false,
-    active: true,
+    active: overrides.active ?? true,
     createdAt: new Date("2026-01-01T00:00:00Z"),
     updatedAt: new Date("2026-01-01T00:00:00Z"),
   };
 };
+
+/**
+ * Answers `findMany` the way the real table would, honouring the
+ * `where: { active: true }` that separates `listDepositTiers` from
+ * `listAllDepositTiers`. A fake that ignored the filter would let a test pass
+ * whichever of the two the code called, which is exactly the distinction the
+ * deactivation tests exist to pin down.
+ */
+const tiersMatching = (
+  rows: Array<ReturnType<typeof tierRow>>,
+  // `unknown` rather than boolean: Prisma types `active` as boolean | BoolFilter,
+  // and only the plain-boolean form is what these callers pass.
+  args?: { where?: { active?: unknown } },
+) => {
+  const activeOnly = args?.where?.active === true;
+  return [...(activeOnly ? rows.filter((row) => row.active) : rows)].sort(
+    (a, b) => a.amount - b.amount,
+  );
+};
+
+/**
+ * A full ShopConfig row from just the fields a test cares about, in the same
+ * spirit as `tierRow`. Defaults to a EUR-only shop, since that's the shape
+ * every suite except the currency ones is implicitly assuming.
+ */
+const shopConfigRow = (
+  overrides: {
+    depositProductId?: string | null;
+    supportedCurrencies?: string[];
+  } = {},
+) => ({
+  shop: SHOP,
+  depositProductId: overrides.depositProductId ?? null,
+  supportedCurrencies: JSON.stringify(overrides.supportedCurrencies ?? ["EUR"]),
+  createdAt: new Date("2026-01-01T00:00:00Z"),
+  updatedAt: new Date("2026-01-01T00:00:00Z"),
+});
+
+/** The function id every fake uses for Pfandlock's own cart transform. */
+const DEPOSIT_FUNCTION_ID = "01234567-89ab-cdef-0123-456789abcdef";
+
+/**
+ * The combined cart-transform lookup, answered as a shop would - the app's
+ * registered transforms plus the functions they could point at.
+ *
+ * `otherAppTransform` models a registration belonging to a different function
+ * than the deposit one. Shopify scopes `cartTransforms` to the calling app, so
+ * this stands for a second transform Pfandlock itself might ship, not a rival
+ * app's - the latter can't reach this query at all.
+ */
+const cartTransformReply = (options: {
+  depositTransform?: boolean;
+  otherAppTransform?: boolean;
+  functionDeployed?: boolean;
+} = {}) => ({
+  cartTransforms: {
+    nodes: [
+      ...(options.depositTransform
+        ? [
+            {
+              id: "gid://shopify/CartTransform/1",
+              functionId: DEPOSIT_FUNCTION_ID,
+            },
+          ]
+        : []),
+      ...(options.otherAppTransform
+        ? [
+            {
+              id: "gid://shopify/CartTransform/2",
+              functionId: "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            },
+          ]
+        : []),
+    ],
+  },
+  shopifyFunctions: {
+    nodes:
+      options.functionDeployed === false
+        ? []
+        : [{ id: DEPOSIT_FUNCTION_ID, handle: "deposit-cart-transform" }],
+  },
+});
 
 beforeEach(() => {
   // reset, not clear: clearAllMocks wipes recorded calls but leaves any
@@ -231,6 +326,212 @@ describe("resolveDepositStatus", () => {
       state: "attaching",
       tier: { amount: 29, currency: "EUR", label: null },
     });
+  });
+});
+
+describe("readSupportedCurrencies", () => {
+  /** Puts a raw column value on record, bypassing the usual JSON writer. */
+  const stored = (supportedCurrencies: string | null) => {
+    findShopConfig.mockResolvedValue(
+      supportedCurrencies === null
+        ? null
+        : { ...shopConfigRow(), supportedCurrencies },
+    );
+  };
+
+  it("reads back a stored list", async () => {
+    stored('["EUR","USD"]');
+
+    await expect(readSupportedCurrencies(SHOP)).resolves.toEqual(["EUR", "USD"]);
+  });
+
+  it("treats a shop with no config row as not-yet-detected", async () => {
+    stored(null);
+
+    await expect(readSupportedCurrencies(SHOP)).resolves.toEqual([]);
+  });
+
+  it("survives a value that isn't the JSON array it should be", async () => {
+    // The column is a plain string, so a hand-edited row shouldn't be able to
+    // take down every page that reads it. Callers already handle "empty" as
+    // "detect again", which is the right recovery here too.
+    for (const bad of ["", "not json", '{"EUR":true}', "null"]) {
+      stored(bad);
+      await expect(readSupportedCurrencies(SHOP)).resolves.toEqual([]);
+    }
+  });
+
+  it("drops entries that aren't currency codes", async () => {
+    stored('["EUR",42,null,"USD"]');
+
+    await expect(readSupportedCurrencies(SHOP)).resolves.toEqual(["EUR", "USD"]);
+  });
+});
+
+describe("detectSupportedCurrencies", () => {
+  /**
+   * A shop answering the currency query. `presentment` is what Shopify
+   * reports as enabled across the shop's markets, which is the real source
+   * for "what can a buyer be charged in".
+   */
+  const fakeCurrencyShop = (options: {
+    currencyCode?: string | null;
+    presentment?: string[] | null;
+  } = {}) => {
+    upsertShopConfig.mockImplementation((args) =>
+      prismaResult(
+        shopConfigRow({
+          supportedCurrencies: JSON.parse(
+            (args.create as { supportedCurrencies: string }).supportedCurrencies,
+          ),
+        }),
+      ),
+    );
+
+    const graphql = vi.fn(async (query: string) => {
+      if (query.includes("query shopSupportedCurrencies")) {
+        return {
+          json: async () => ({
+            data: {
+              shop: {
+                currencyCode:
+                  options.currencyCode === undefined ? "EUR" : options.currencyCode,
+                enabledPresentmentCurrencies: options.presentment ?? [],
+              },
+            },
+          }),
+        };
+      }
+      throw new Error(`fakeCurrencyShop got an unexpected operation:\n${query}`);
+    });
+
+    return { admin: { graphql } as unknown as AdminApiContext, graphql };
+  };
+
+  it("reports a single-currency shop as just that currency", async () => {
+    const store = fakeCurrencyShop({ currencyCode: "EUR" });
+
+    await expect(detectSupportedCurrencies(store.admin, SHOP)).resolves.toEqual([
+      "EUR",
+    ]);
+  });
+
+  it("includes every currency the shop's markets can charge in", async () => {
+    const store = fakeCurrencyShop({
+      currencyCode: "EUR",
+      presentment: ["USD", "CHF"],
+    });
+
+    await expect(detectSupportedCurrencies(store.admin, SHOP)).resolves.toEqual([
+      "EUR",
+      "USD",
+      "CHF",
+    ]);
+  });
+
+  it("leads with the shop currency and lists it once", async () => {
+    // Shopify reports the shop's own currency among the presentment ones. It
+    // has to lead the list (the deposit variants are priced in it, so it's
+    // the default a merchant wants) and can't appear twice, or the dropdown
+    // shows a duplicate option.
+    const store = fakeCurrencyShop({
+      currencyCode: "EUR",
+      presentment: ["USD", "EUR"],
+    });
+
+    await expect(detectSupportedCurrencies(store.admin, SHOP)).resolves.toEqual([
+      "EUR",
+      "USD",
+    ]);
+  });
+
+  it("stores the list as JSON so later requests skip the lookup", async () => {
+    const store = fakeCurrencyShop({
+      currencyCode: "EUR",
+      presentment: ["USD"],
+    });
+
+    await detectSupportedCurrencies(store.admin, SHOP);
+
+    expect(upsertShopConfig).toHaveBeenCalledWith({
+      where: { shop: SHOP },
+      create: { shop: SHOP, supportedCurrencies: '["EUR","USD"]' },
+      update: { supportedCurrencies: '["EUR","USD"]' },
+    });
+  });
+
+  it("still returns the currencies when they can't be cached", async () => {
+    // Caching is an optimisation; the answer came back fine. Coupling the two
+    // took the tier form down on a server whose Prisma client predated the
+    // supportedCurrencies column - Shopify had answered, and the page went
+    // dark anyway.
+    const store = fakeCurrencyShop({ currencyCode: "EUR" });
+    upsertShopConfig.mockRejectedValue(
+      new Error("Unknown argument `supportedCurrencies`"),
+    );
+
+    await expect(detectSupportedCurrencies(store.admin, SHOP)).resolves.toEqual([
+      "EUR",
+    ]);
+  });
+
+  it("refuses to guess when the shop's currency can't be read", async () => {
+    // Storing a wrong list is worse than storing none: it would let a
+    // merchant build tiers no product can ever match.
+    const store = fakeCurrencyShop({ currencyCode: null });
+
+    await expect(
+      detectSupportedCurrencies(store.admin, SHOP),
+    ).rejects.toThrow(/currency/i);
+    expect(upsertShopConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe("ensureSupportedCurrencies", () => {
+  const graphqlShouldNotRun = vi.fn(async () => {
+    throw new Error("ensureSupportedCurrencies should not have called Shopify");
+  });
+
+  it("uses what's already stored without calling Shopify", async () => {
+    findShopConfig.mockResolvedValue(
+      shopConfigRow({ supportedCurrencies: ["EUR", "USD"] }),
+    );
+    const admin = { graphql: graphqlShouldNotRun } as unknown as AdminApiContext;
+
+    await expect(ensureSupportedCurrencies(admin, SHOP)).resolves.toEqual([
+      "EUR",
+      "USD",
+    ]);
+    expect(graphqlShouldNotRun).not.toHaveBeenCalled();
+  });
+
+  it("detects for a shop that has never been looked up", async () => {
+    // An install predating currency detection, or one whose afterAuth hook
+    // failed - either way the answer is to go and find out, not to refuse.
+    findShopConfig.mockResolvedValue(null);
+    upsertShopConfig.mockResolvedValue(shopConfigRow());
+    const graphql = vi.fn(async () => ({
+      json: async () => ({
+        data: { shop: { currencyCode: "GBP", enabledPresentmentCurrencies: [] } },
+      }),
+    }));
+    const admin = { graphql } as unknown as AdminApiContext;
+
+    await expect(ensureSupportedCurrencies(admin, SHOP)).resolves.toEqual(["GBP"]);
+  });
+
+  it("re-detects when a stored list is empty rather than trusting it", async () => {
+    findShopConfig.mockResolvedValue(shopConfigRow({ supportedCurrencies: [] }));
+    upsertShopConfig.mockResolvedValue(shopConfigRow());
+    const graphql = vi.fn(async () => ({
+      json: async () => ({
+        data: { shop: { currencyCode: "EUR", enabledPresentmentCurrencies: [] } },
+      }),
+    }));
+    const admin = { graphql } as unknown as AdminApiContext;
+
+    await expect(ensureSupportedCurrencies(admin, SHOP)).resolves.toEqual(["EUR"]);
+    expect(graphql).toHaveBeenCalled();
   });
 });
 
@@ -663,6 +964,8 @@ describe("applyMigrationImport", () => {
     /** Tiers the destination already has before the import runs. */
     tiers?: Array<ReturnType<typeof tierRow>>;
     depositProductId?: string | null;
+    /** What the destination shop can charge in. EUR-only unless varied. */
+    supportedCurrencies?: string[];
     /** userErrors for the productSet mutation that creates a tier. */
     tierErrors?: Array<{ message: string }>;
     /** userErrors for the metafieldsSet mutation that assigns deposits. */
@@ -689,20 +992,17 @@ describe("applyMigrationImport", () => {
     let depositProductId = options.depositProductId ?? null;
     let variantSeq = 0;
 
-    const shopConfigRow = () => ({
-      shop: SHOP,
-      depositProductId,
-      createdAt: new Date("2026-01-01T00:00:00Z"),
-      updatedAt: new Date("2026-01-01T00:00:00Z"),
-    });
+    const configRow = () =>
+      shopConfigRow({
+        depositProductId,
+        supportedCurrencies: options.supportedCurrencies,
+      });
 
-    findMany.mockImplementation(() =>
-      prismaResult([...tiers].sort((a, b) => a.amount - b.amount)),
-    );
+    findMany.mockImplementation((args) => prismaResult(tiersMatching(tiers, args)));
     findShopConfig.mockImplementation(() =>
-      prismaResult(depositProductId ? shopConfigRow() : null),
+      prismaResult(depositProductId ? configRow() : null),
     );
-    upsertShopConfig.mockImplementation(() => prismaResult(shopConfigRow()));
+    upsertShopConfig.mockImplementation(() => prismaResult(configRow()));
     createTierRow.mockImplementation((args) => {
       const data = args.data as {
         amount: number;
@@ -767,6 +1067,18 @@ describe("applyMigrationImport", () => {
 
         if (query.includes("query shopId")) {
           return reply({ shop: { id: "gid://shopify/Shop/1" } });
+        }
+
+        // Reached when the destination shop has no ShopConfig row yet, so
+        // createDepositTier has to detect what it can charge in before
+        // writing the imported tiers.
+        if (query.includes("query shopSupportedCurrencies")) {
+          operations.push("detectCurrencies");
+          const [currencyCode, ...presentment] =
+            options.supportedCurrencies ?? ["EUR"];
+          return reply({
+            shop: { currencyCode, enabledPresentmentCurrencies: presentment },
+          });
         }
 
         if (query.includes("mutation syncDepositTiers")) {
@@ -1022,6 +1334,28 @@ describe("applyMigrationImport", () => {
     expect(store.assignedBatches).toEqual([]);
   });
 
+  it("refuses a config whose currency the destination can't charge in", async () => {
+    // Importing a EUR store's setup into a GBP-only one used to "succeed"
+    // and leave every imported product orphaned - checkout blocked, with
+    // nothing in the app saying why. createDepositTier's currency check
+    // stops it here instead.
+    const store = fakeStore({
+      catalogue: [matchingProduct],
+      depositProductId: "gid://shopify/Product/deposit",
+      supportedCurrencies: ["GBP"],
+    });
+
+    await expect(
+      applyMigrationImport(
+        store.admin,
+        SHOP,
+        file({ productAssignments: [assignment()] }),
+      ),
+    ).rejects.toThrow(/EUR isn't one of this store's currencies \(GBP\)/);
+
+    expect(store.assignedBatches).toEqual([]);
+  });
+
   it("reports the counts the completion banner reads", async () => {
     const store = fakeStore({
       catalogue: [
@@ -1063,7 +1397,7 @@ describe("getMigrationExport", () => {
    */
   const fakeSourceStore = (options: {
     pages?: Array<{ products: CatalogueProduct[]; hasNextPage?: boolean }>;
-    cartTransforms?: Array<{ id: string }>;
+    enforcementActive?: boolean;
   }) => {
     const pages = options.pages ?? [{ products: [] }];
     const cursors: Array<string | null> = [];
@@ -1073,10 +1407,10 @@ describe("getMigrationExport", () => {
       async (query: string, init?: { variables?: Record<string, unknown> }) => {
         const reply = (data: unknown) => ({ json: async () => ({ data }) });
 
-        if (query.includes("query migrationCartTransform")) {
-          return reply({
-            cartTransforms: { nodes: options.cartTransforms ?? [] },
-          });
+        if (query.includes("query depositCartTransform")) {
+          return reply(
+            cartTransformReply({ depositTransform: options.enforcementActive }),
+          );
         }
 
         if (query.includes("query migrationProducts")) {
@@ -1239,8 +1573,7 @@ describe("getMigrationExport", () => {
     expect(off.enforcementActive).toBe(false);
 
     const on = await getMigrationExport(
-      fakeSourceStore({ cartTransforms: [{ id: "gid://shopify/CartTransform/1" }] })
-        .admin,
+      fakeSourceStore({ enforcementActive: true }).admin,
       "old.myshopify.com",
     );
     expect(on.enforcementActive).toBe(true);
@@ -1336,7 +1669,7 @@ describe("getMigrationExport", () => {
           ],
         },
       ],
-      cartTransforms: [{ id: "gid://shopify/CartTransform/1" }],
+      enforcementActive: true,
     });
 
     const data = await getMigrationExport(admin, "old.myshopify.com");
@@ -1363,12 +1696,7 @@ describe("getOnboardingStatus", () => {
     findMany.mockResolvedValue(options.tiers ?? []);
     findShopConfig.mockResolvedValue(
       options.depositProductId
-        ? {
-            shop: SHOP,
-            depositProductId: options.depositProductId,
-            createdAt: new Date("2026-01-01T00:00:00Z"),
-            updatedAt: new Date("2026-01-01T00:00:00Z"),
-          }
+        ? shopConfigRow({ depositProductId: options.depositProductId })
         : null,
     );
 
@@ -1385,13 +1713,11 @@ describe("getOnboardingStatus", () => {
         });
       }
 
-      if (query.includes("query onboardingCartTransform")) {
+      if (query.includes("query depositCartTransform")) {
         operations.push("transform");
-        return reply({
-          cartTransforms: {
-            nodes: options.cartTransformActive ? [{ id: "gid://shopify/CartTransform/1" }] : [],
-          },
-        });
+        return reply(
+          cartTransformReply({ depositTransform: options.cartTransformActive }),
+        );
       }
 
       if (query.includes("query onboardingShop")) {
@@ -1577,6 +1903,7 @@ describe("createDepositTier", () => {
   interface VariantInput {
     id?: string;
     price: string;
+    taxable: boolean;
     optionValues: Array<{ optionName: string; name: string }>;
   }
 
@@ -1598,6 +1925,14 @@ describe("createDepositTier", () => {
   const fakeDepositProduct = (options: {
     tiers?: Array<ReturnType<typeof tierRow>>;
     depositProductId?: string | null;
+    /**
+     * What the shop can charge in. Given here it's already on ShopConfig, so
+     * no detection call happens; omitted, the shop has no config row yet and
+     * createDepositTier detects (see the shopSupportedCurrencies branch).
+     */
+    supportedCurrencies?: string[];
+    /** What detection returns, for the shops that have to run it. */
+    detected?: string[];
     userErrors?: Array<{ message: string }>;
   } = {}) => {
     const tiers = [...(options.tiers ?? [])];
@@ -1606,28 +1941,24 @@ describe("createDepositTier", () => {
     let depositProductId = options.depositProductId ?? null;
     let variantSeq = 0;
 
-    findMany.mockImplementation(() =>
-      prismaResult([...tiers].sort((a, b) => a.amount - b.amount)),
-    );
+    findMany.mockImplementation((args) => prismaResult(tiersMatching(tiers, args)));
     findShopConfig.mockImplementation(() =>
       prismaResult(
-        depositProductId
-          ? {
-              shop: SHOP,
+        depositProductId || options.supportedCurrencies
+          ? shopConfigRow({
               depositProductId,
-              createdAt: new Date("2026-01-01T00:00:00Z"),
-              updatedAt: new Date("2026-01-01T00:00:00Z"),
-            }
+              supportedCurrencies: options.supportedCurrencies,
+            })
           : null,
       ),
     );
     upsertShopConfig.mockImplementation(() =>
-      prismaResult({
-        shop: SHOP,
-        depositProductId,
-        createdAt: new Date("2026-01-01T00:00:00Z"),
-        updatedAt: new Date("2026-01-01T00:00:00Z"),
-      }),
+      prismaResult(
+        shopConfigRow({
+          depositProductId,
+          supportedCurrencies: options.supportedCurrencies,
+        }),
+      ),
     );
     createTierRow.mockImplementation((args) => {
       const data = args.data as {
@@ -1684,6 +2015,13 @@ describe("createDepositTier", () => {
           return reply({ shop: { id: "gid://shopify/Shop/1" } });
         }
 
+        if (query.includes("query shopSupportedCurrencies")) {
+          const [currencyCode, ...presentment] = options.detected ?? ["EUR"];
+          return reply({
+            shop: { currencyCode, enabledPresentmentCurrencies: presentment },
+          });
+        }
+
         if (query.includes("mutation syncDepositTiers")) {
           syncedMetafields.push(
             ...(init?.variables?.metafields as Array<Record<string, unknown>>),
@@ -1723,7 +2061,14 @@ describe("createDepositTier", () => {
 
     await createDepositTier(store.admin, SHOP, { amount: 8 });
 
-    expect(upsertShopConfig).toHaveBeenCalledTimes(1);
+    // Asserted by content rather than call count: a shop with no config row
+    // yet also gets one written by currency detection, and it's specifically
+    // the product id that later tiers depend on.
+    expect(upsertShopConfig).toHaveBeenCalledWith(
+      expect.objectContaining({
+        update: { depositProductId: "gid://shopify/Product/deposit" },
+      }),
+    );
   });
 
   it("targets the existing product instead of making a second one", async () => {
@@ -1768,6 +2113,176 @@ describe("createDepositTier", () => {
       formatAmount(15),
       formatAmount(29),
     ]);
+  });
+
+  it("rejects an amount that already exists, in plain words", async () => {
+    // Left to the database this surfaces as "Unique constraint failed on the
+    // fields: (`shop`,`amount`,`currency`)", which names an index the merchant
+    // has never heard of.
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+      tiers: [tierRow(8)],
+    });
+
+    await expect(
+      createDepositTier(store.admin, SHOP, { amount: 8 }),
+    ).rejects.toThrow(`A deposit amount of ${formatAmount(8, "EUR")} already exists.`);
+  });
+
+  it("says to reactivate when the clashing amount is deactivated", async () => {
+    // The unique index covers inactive rows too, so this would fail either
+    // way - but "it already exists" is baffling when the merchant can't see
+    // it in the active list. Point at the fix instead.
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+      tiers: [tierRow(8, { active: false })],
+    });
+
+    await expect(
+      createDepositTier(store.admin, SHOP, { amount: 8 }),
+    ).rejects.toThrow(/deactivated\. Reactivate it instead/);
+  });
+
+  it("doesn't touch Shopify when the amount is a duplicate", async () => {
+    // productSet would mint a variant for the amount before the database
+    // refused it, leaving a priced variant on the deposit product with no
+    // tier behind it.
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+      tiers: [tierRow(8)],
+    });
+
+    await expect(
+      createDepositTier(store.admin, SHOP, { amount: 8 }),
+    ).rejects.toThrow();
+
+    expect(store.productSetCalls).toEqual([]);
+    expect(createTierRow).not.toHaveBeenCalled();
+  });
+
+  it("allows the same amount in a different currency", async () => {
+    // `[shop, amount, currency]` is the real key - 8 EUR and 8 USD are
+    // different tiers, and the duplicate check has to agree with the index.
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+      supportedCurrencies: ["EUR", "USD"],
+      tiers: [tierRow(8)],
+    });
+
+    await expect(
+      createDepositTier(store.admin, SHOP, { amount: 8, currency: "USD" }),
+    ).resolves.toMatchObject({ amount: 8, currency: "USD" });
+  });
+
+  it("translates a unique-constraint race into the same plain message", async () => {
+    // Two tabs submitting the same new amount: both pass the duplicate check,
+    // and the database catches the second one.
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+    });
+    createTierRow.mockRejectedValue(
+      Object.assign(new Error("Unique constraint failed"), { code: "P2002" }),
+    );
+
+    await expect(
+      createDepositTier(store.admin, SHOP, { amount: 8 }),
+    ).rejects.toThrow(`A deposit amount of ${formatAmount(8, "EUR")} already exists.`);
+  });
+
+  it("lets an unrelated database failure through untouched", async () => {
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+    });
+    createTierRow.mockRejectedValue(
+      Object.assign(new Error("Connection terminated"), { code: "P1017" }),
+    );
+
+    await expect(
+      createDepositTier(store.admin, SHOP, { amount: 8 }),
+    ).rejects.toThrow("Connection terminated");
+  });
+
+  it("sets taxable on the variant from the tax checkbox", async () => {
+    // The flag was being stored in Postgres and shown in the tier list while
+    // the variant Shopify actually charges kept its default treatment.
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+    });
+
+    await createDepositTier(store.admin, SHOP, { amount: 8, chargeTax: true });
+
+    expect(store.productSetCalls[0].input.variants[0].taxable).toBe(true);
+  });
+
+  it("leaves the deposit untaxed when the box is unticked", async () => {
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+    });
+
+    await createDepositTier(store.admin, SHOP, { amount: 8 });
+
+    expect(store.productSetCalls[0].input.variants[0].taxable).toBe(false);
+  });
+
+  it("preserves each existing tier's tax treatment when re-sending it", async () => {
+    // productSet takes each variant entry as that variant's whole desired
+    // state, so leaving `taxable` off would silently reset every existing
+    // tier to Shopify's default the next time any amount was added.
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+      tiers: [
+        { ...tierRow(8, { variantId: "gid://shopify/ProductVariant/8" }), chargeTax: true },
+        { ...tierRow(15, { variantId: "gid://shopify/ProductVariant/15" }), chargeTax: false },
+      ],
+    });
+
+    await createDepositTier(store.admin, SHOP, { amount: 25 });
+
+    expect(
+      store.productSetCalls[0].input.variants.map((variant) => variant.taxable),
+    ).toEqual([true, false, false]);
+  });
+
+  it("re-sends a deactivated tier's variant too", async () => {
+    // productSet deletes any variant left out of the list. Sending only the
+    // active tiers would destroy a deactivated one's variant the next time
+    // anything is added - orphaning the tier for good, and breaking carts
+    // that already hold that deposit line.
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+      tiers: [
+        tierRow(8, { variantId: "gid://shopify/ProductVariant/8", active: false }),
+        tierRow(15, { variantId: "gid://shopify/ProductVariant/15" }),
+      ],
+    });
+
+    await createDepositTier(store.admin, SHOP, { amount: 25 });
+
+    expect(
+      store.productSetCalls[0].input.variants.map((variant) => variant.id),
+    ).toEqual([
+      "gid://shopify/ProductVariant/8",
+      "gid://shopify/ProductVariant/15",
+      undefined, // the new one, which productSet mints an id for
+    ]);
+  });
+
+  it("leaves a deactivated tier out of what the Functions read", async () => {
+    // The variant survives on the product, but the amount stops being
+    // chargeable - those two have to move independently.
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+      tiers: [
+        tierRow(8, { variantId: "gid://shopify/ProductVariant/8", active: false }),
+      ],
+    });
+
+    await createDepositTier(store.admin, SHOP, { amount: 25 });
+
+    const synced = JSON.parse(
+      store.syncedMetafields[0].value as string,
+    ) as Array<{ amount: number }>;
+    expect(synced.map((tier) => tier.amount)).toEqual([25]);
   });
 
   it("prices variants as a decimal string, not minor units", async () => {
@@ -1824,8 +2339,74 @@ describe("createDepositTier", () => {
     });
   });
 
+  it("accepts a currency the shop actually sells in", async () => {
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+      supportedCurrencies: ["EUR", "USD"],
+    });
+
+    await expect(
+      createDepositTier(store.admin, SHOP, { amount: 800, currency: "USD" }),
+    ).resolves.toMatchObject({ currency: "USD" });
+  });
+
+  it("refuses a currency the shop can't charge in", async () => {
+    // The whole point of the check: both Functions match a product's pfand
+    // currency against tier currencies exactly, so a tier in a currency the
+    // shop never sells in can only ever read as orphaned - which blocks
+    // checkout for every product assigned to it.
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+      supportedCurrencies: ["EUR"],
+    });
+
+    await expect(
+      createDepositTier(store.admin, SHOP, { amount: 800, currency: "USD" }),
+    ).rejects.toThrow(/USD isn't one of this store's currencies \(EUR\)/);
+  });
+
+  it("writes nothing at all when the currency is rejected", async () => {
+    // A rejected tier that still created a variant would leave an unbacked
+    // price on the deposit product for a merchant to find later.
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+      supportedCurrencies: ["EUR"],
+    });
+
+    await expect(
+      createDepositTier(store.admin, SHOP, { amount: 800, currency: "GBP" }),
+    ).rejects.toThrow();
+
+    expect(store.productSetCalls).toEqual([]);
+    expect(createTierRow).not.toHaveBeenCalled();
+    expect(store.syncedMetafields).toEqual([]);
+  });
+
+  it("detects the shop's currencies when none are on record yet", async () => {
+    // First tier on a shop whose afterAuth detection never ran. Refusing
+    // would leave the merchant stuck with no way to add anything.
+    const store = fakeDepositProduct({ detected: ["EUR", "USD"] });
+
+    await expect(
+      createDepositTier(store.admin, SHOP, { amount: 800, currency: "USD" }),
+    ).resolves.toMatchObject({ currency: "USD" });
+  });
+
+  it("rejects the default currency too when the shop doesn't use it", async () => {
+    // EUR is only a fallback for callers that don't pass one - it gets no
+    // special treatment on a shop that sells in something else.
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+      supportedCurrencies: ["GBP"],
+    });
+
+    await expect(
+      createDepositTier(store.admin, SHOP, { amount: 800 }),
+    ).rejects.toThrow(/EUR isn't one of this store's currencies/);
+  });
+
   it("passes an explicit currency, label and tax flag through", async () => {
-    const store = fakeDepositProduct();
+    const store = fakeDepositProduct({ detected: ["EUR", "USD"] });
 
     await createDepositTier(store.admin, SHOP, {
       amount: 800,
@@ -1880,6 +2461,218 @@ describe("createDepositTier", () => {
 
     // Nothing recorded locally that Shopify doesn't have.
     expect(createTierRow).not.toHaveBeenCalled();
+  });
+});
+
+describe("isDepositCartTransformActive", () => {
+  const fakeTransforms = (reply: ReturnType<typeof cartTransformReply>) => {
+    const graphql = vi.fn(async (query: string) => {
+      if (query.includes("query depositCartTransform")) {
+        return { json: async () => ({ data: reply }) };
+      }
+      throw new Error(`fakeTransforms got an unexpected operation:\n${query}`);
+    });
+    return { admin: { graphql } as unknown as AdminApiContext };
+  };
+
+  it("reports off when nothing is registered", async () => {
+    const { admin } = fakeTransforms(cartTransformReply({}));
+
+    await expect(isDepositCartTransformActive(admin)).resolves.toBe(false);
+  });
+
+  it("reports on when the deposit transform is registered", async () => {
+    const { admin } = fakeTransforms(
+      cartTransformReply({ depositTransform: true }),
+    );
+
+    await expect(isDepositCartTransformActive(admin)).resolves.toBe(true);
+  });
+
+  it("doesn't count a registration for some other function", async () => {
+    // Shopify scopes `cartTransforms` to the calling app, so this stands for a
+    // second transform Pfandlock itself might ship - not another app's, which
+    // can't appear here at all. Matching on the function id keeps "enabled"
+    // meaning the deposit one specifically.
+    const { admin } = fakeTransforms(
+      cartTransformReply({ otherAppTransform: true }),
+    );
+
+    await expect(isDepositCartTransformActive(admin)).resolves.toBe(false);
+  });
+
+  it("still reports on when the function can't be identified", async () => {
+    // Nothing to match against - the function isn't deployed to this
+    // environment. Everything in `cartTransforms` belongs to this app anyway,
+    // so reporting "off" on a shop where it demonstrably runs would be worse
+    // than being imprecise.
+    const { admin } = fakeTransforms(
+      cartTransformReply({ depositTransform: true, functionDeployed: false }),
+    );
+
+    await expect(isDepositCartTransformActive(admin)).resolves.toBe(true);
+  });
+});
+
+describe("listDepositTiers vs listAllDepositTiers", () => {
+  it("offers only active tiers for assigning to a product", async () => {
+    // The product-assign page builds its choices from this, so a deactivated
+    // amount has to stop being offered - that's what makes deactivation mean
+    // anything to a merchant.
+    findMany.mockImplementation((args) =>
+      prismaResult(
+        tiersMatching([tierRow(8, { active: false }), tierRow(15)], args),
+      ),
+    );
+
+    await expect(listDepositTiers(SHOP)).resolves.toMatchObject([
+      { amount: 15 },
+    ]);
+  });
+
+  it("keeps deactivated tiers visible to the page that manages them", async () => {
+    findMany.mockImplementation((args) =>
+      prismaResult(
+        tiersMatching([tierRow(8, { active: false }), tierRow(15)], args),
+      ),
+    );
+
+    await expect(listAllDepositTiers(SHOP)).resolves.toMatchObject([
+      { amount: 8, active: false },
+      { amount: 15, active: true },
+    ]);
+  });
+
+  it("orphans a product still carrying a deactivated amount", async () => {
+    // The deposit lives on the product's own metafield, so deactivating a
+    // tier can't unassign anything - the product keeps the amount and reads
+    // as orphaned, which is what blocks it at checkout.
+    const activeTiers = [{ amount: 15, currency: "EUR", label: null }];
+
+    expect(
+      resolveDepositStatus({ amount: "0.08", currencyCode: "EUR" }, activeTiers),
+    ).toEqual({ state: "orphaned", amount: 8, currency: "EUR" });
+  });
+});
+
+describe("setDepositTierActive", () => {
+  /**
+   * A shop whose tier rows respond to updateMany the way Postgres would, so
+   * the metafield sync that follows sees the post-update list - which is the
+   * whole point of the operation.
+   */
+  const fakeTierStore = (options: {
+    tiers?: Array<ReturnType<typeof tierRow>>;
+    syncErrors?: Array<{ message: string }>;
+  } = {}) => {
+    const tiers = [...(options.tiers ?? [])];
+    const syncedMetafields: Array<Record<string, unknown>> = [];
+
+    findMany.mockImplementation((args) => prismaResult(tiersMatching(tiers, args)));
+    updateTierRows.mockImplementation((args) => {
+      const where = args.where as { id?: string; shop?: string };
+      const data = args.data as { active: boolean };
+      const matched = tiers.filter(
+        (tier) => tier.id === where.id && tier.shop === where.shop,
+      );
+      for (const tier of matched) tier.active = data.active;
+      return prismaResult({ count: matched.length });
+    });
+
+    const graphql = vi.fn(
+      async (query: string, init?: { variables?: Record<string, unknown> }) => {
+        const reply = (data: unknown) => ({ json: async () => ({ data }) });
+
+        if (query.includes("query shopId")) {
+          return reply({ shop: { id: "gid://shopify/Shop/1" } });
+        }
+
+        if (query.includes("mutation syncDepositTiers")) {
+          syncedMetafields.push(
+            ...(init?.variables?.metafields as Array<Record<string, unknown>>),
+          );
+          return reply({
+            metafieldsSet: { userErrors: options.syncErrors ?? [] },
+          });
+        }
+
+        throw new Error(`fakeTierStore got an unexpected operation:\n${query}`);
+      },
+    );
+
+    return {
+      admin: { graphql } as unknown as AdminApiContext,
+      graphql,
+      syncedMetafields,
+      tiers,
+    };
+  };
+
+  /** The amounts the Functions would see, read out of the synced metafield. */
+  const syncedAmounts = (metafields: Array<Record<string, unknown>>) =>
+    (JSON.parse(metafields[0].value as string) as Array<{ amount: number }>).map(
+      (tier) => tier.amount,
+    );
+
+  it("marks the tier inactive", async () => {
+    const store = fakeTierStore({ tiers: [tierRow(8)] });
+
+    await setDepositTierActive(store.admin, SHOP, "tier-8-EUR", false);
+
+    expect(updateTierRows).toHaveBeenCalledWith({
+      where: { id: "tier-8-EUR", shop: SHOP },
+      data: { active: false },
+    });
+  });
+
+  it("takes the tier out of what the Functions read", async () => {
+    // The DB flag on its own changes nothing for a buyer - the Cart Transform
+    // and Validation functions only ever see the shop metafield, so this sync
+    // is what actually retires the amount.
+    const store = fakeTierStore({ tiers: [tierRow(8), tierRow(15)] });
+
+    await setDepositTierActive(store.admin, SHOP, "tier-8-EUR", false);
+
+    expect(syncedAmounts(store.syncedMetafields)).toEqual([15]);
+  });
+
+  it("puts a reactivated tier back", async () => {
+    const store = fakeTierStore({
+      tiers: [tierRow(8, { active: false }), tierRow(15)],
+    });
+
+    await setDepositTierActive(store.admin, SHOP, "tier-8-EUR", true);
+
+    expect(syncedAmounts(store.syncedMetafields)).toEqual([8, 15]);
+  });
+
+  it("stops at a tier belonging to another shop", async () => {
+    // Tier ids ride in on a form post, and DepositTier is one table shared by
+    // every install - an id alone can't be allowed to reach across shops.
+    const store = fakeTierStore({
+      tiers: [{ ...tierRow(8), shop: "someone-else.myshopify.com" }],
+    });
+
+    await expect(
+      setDepositTierActive(store.admin, SHOP, "tier-8-EUR", false),
+    ).rejects.toThrow("That deposit amount no longer exists.");
+
+    // Nothing changed, so nothing should have been published either.
+    expect(store.syncedMetafields).toEqual([]);
+  });
+
+  it("reports a failed sync instead of quietly leaving it out of step", async () => {
+    // The row is already flipped at this point. Surfacing the failure is what
+    // gets the merchant to retry; swallowing it would leave the Functions
+    // charging an amount the app shows as retired.
+    const store = fakeTierStore({
+      tiers: [tierRow(8)],
+      syncErrors: [{ message: "Metafield write failed" }],
+    });
+
+    await expect(
+      setDepositTierActive(store.admin, SHOP, "tier-8-EUR", false),
+    ).rejects.toThrow("Metafield write failed");
   });
 });
 
@@ -2185,14 +2978,10 @@ describe("getDashboardSummary", () => {
           });
         }
 
-        if (query.includes("query dashboardCartTransformStatus")) {
-          return reply({
-            cartTransforms: {
-              nodes: options.cartTransformActive
-                ? [{ id: "gid://shopify/CartTransform/1" }]
-                : [],
-            },
-          });
+        if (query.includes("query depositCartTransform")) {
+          return reply(
+            cartTransformReply({ depositTransform: options.cartTransformActive }),
+          );
         }
 
         if (query.includes("query productsWithDeposit")) {

@@ -41,6 +41,20 @@ model Session {
 model ShopConfig {
   shop             String   @id
   depositProductId String?
+  // JSON array of the currency codes this shop can actually charge in, e.g.
+  // `["EUR","USD"]` - the shop's own currency plus every enabled presentment
+  // currency, detected from Shopify (see detectSupportedCurrencies).
+  //
+  // A tier's currency has to come from this list. The deposit-charging
+  // functions match a product's `$app:pfand` currency against tier currencies
+  // exactly, so a tier in a currency the shop never uses can never match: every
+  // product on it would read as orphaned and checkout would be blocked for
+  // them. Constraining the tier form to this list is what prevents that.
+  //
+  // Empty (`"[]"`) means "not detected yet", not "no currencies" - detection
+  // needs an admin API call, so a row created before the first successful
+  // detection legitimately has none.
+  supportedCurrencies String @default("[]")
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
 }

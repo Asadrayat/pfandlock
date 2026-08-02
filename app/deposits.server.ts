@@ -24,16 +24,141 @@ export const PFAND_METAFIELD_KEY = "pfand";
 // `syncDepositTiersMetafield`, called whenever the tier list changes.
 export const DEPOSIT_TIERS_METAFIELD_KEY = "deposit_tiers";
 
+/** The Cart Transform function that actually charges the deposit. */
+export const CART_TRANSFORM_FUNCTION_HANDLE = "deposit-cart-transform";
+
 const DEPOSIT_PRODUCT_TITLE = "Pfand (Deposit)";
 // The variant option every tier is distinguished by, e.g. "€0.08", "€0.15".
 const DEPOSIT_OPTION_NAME = "Amount";
 
-/** All configured deposit tiers for a shop, cheapest first. */
+/**
+ * The deposit tiers a shop can currently charge, cheapest first.
+ *
+ * Active only - this is what the Functions get mirrored, and what a merchant
+ * is offered when assigning a deposit to a product. Anything that has to
+ * account for deactivated tiers too (the tier list a merchant manages, and
+ * the deposit product's variant list) wants `listAllDepositTiers`.
+ */
 export async function listDepositTiers(shop: string) {
   return prisma.depositTier.findMany({
     where: { shop, active: true },
     orderBy: { amount: "asc" },
   });
+}
+
+/** Every tier a shop has ever configured, deactivated ones included. */
+export async function listAllDepositTiers(shop: string) {
+  return prisma.depositTier.findMany({
+    where: { shop },
+    orderBy: { amount: "asc" },
+  });
+}
+
+/**
+ * The currency a tier gets when none is given. Only reached by callers that
+ * predate multi-currency support - the tier form always sends one explicitly,
+ * and an EUR that isn't in the shop's list is rejected like any other.
+ */
+export const DEFAULT_CURRENCY = "EUR";
+
+/**
+ * Reads `ShopConfig.supportedCurrencies` back into an array.
+ *
+ * Deliberately total: the column is a plain string, so a hand-edited row or a
+ * value written by an older/newer version of this code shouldn't crash the
+ * page that reads it. Anything unparseable reads as "not detected yet", which
+ * callers already have to handle.
+ */
+function parseSupportedCurrencies(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((code): code is string => typeof code === "string");
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Asks Shopify which currencies this shop can actually charge in and records
+ * them on ShopConfig.
+ *
+ * `enabledPresentmentCurrencies` is the real source for this - it's the set a
+ * buyer can be charged in across all of the shop's markets. (There is no
+ * "sales channel currency" to query; channels don't carry one.) The shop's own
+ * currency leads the list because that's what the deposit product's variants
+ * are priced in, making it the currency a merchant almost always wants.
+ *
+ * Always re-queries rather than trusting what's stored: a merchant can add a
+ * market long after installing, and a stale list would lock them out of a
+ * currency they now sell in.
+ */
+export async function detectSupportedCurrencies(
+  admin: AdminApiContext,
+  shop: string,
+): Promise<string[]> {
+  const response = await admin.graphql(`#graphql
+    query shopSupportedCurrencies {
+      shop {
+        currencyCode
+        enabledPresentmentCurrencies
+      }
+    }`);
+  const { data } = await response.json();
+
+  const shopCurrency: string | undefined = data?.shop?.currencyCode;
+  if (!shopCurrency) {
+    throw new Error("Could not read this store's currency from Shopify.");
+  }
+
+  const presentment: string[] = data.shop.enabledPresentmentCurrencies ?? [];
+  // Set preserves insertion order, so the shop currency stays first.
+  const currencies = [...new Set([shopCurrency, ...presentment])];
+
+  // Storing the answer is a cache, not the answer itself. A failed write
+  // costs one extra API call next time and nothing else, so it must not take
+  // down a page that already has what it asked for - which is exactly what
+  // happened when a running server held a Prisma client from before this
+  // column existed: Shopify returned the currencies, the cache write threw,
+  // and the tier form went dark despite nothing being wrong with the shop.
+  try {
+    await prisma.shopConfig.upsert({
+      where: { shop },
+      create: { shop, supportedCurrencies: JSON.stringify(currencies) },
+      update: { supportedCurrencies: JSON.stringify(currencies) },
+    });
+  } catch (error) {
+    console.error(`Could not cache supported currencies for ${shop}:`, error);
+  }
+
+  return currencies;
+}
+
+/**
+ * Whatever currency list is already on record, without calling Shopify.
+ * Empty means detection hasn't succeeded for this shop yet.
+ */
+export async function readSupportedCurrencies(shop: string): Promise<string[]> {
+  const config = await prisma.shopConfig.findUnique({ where: { shop } });
+  return parseSupportedCurrencies(config?.supportedCurrencies);
+}
+
+/**
+ * The stored currency list, detecting it first if the shop has none yet.
+ *
+ * For callers that need *an* answer rather than a fresh one - validating a
+ * submitted tier, say. Pages that show the list to a merchant should call
+ * `detectSupportedCurrencies` directly so newly added markets appear.
+ */
+export async function ensureSupportedCurrencies(
+  admin: AdminApiContext,
+  shop: string,
+): Promise<string[]> {
+  const stored = await readSupportedCurrencies(shop);
+  if (stored.length > 0) return stored;
+
+  return detectSupportedCurrencies(admin, shop);
 }
 
 /**
@@ -93,6 +218,23 @@ export async function syncDepositTiersMetafield(admin: AdminApiContext, shop: st
 }
 
 /**
+ * Whether a write failed on a unique index - here, always the
+ * `[shop, amount, currency]` one on DepositTier.
+ *
+ * Matched on the code rather than `instanceof PrismaClientKnownRequestError`,
+ * so this doesn't depend on which copy of the Prisma runtime the error was
+ * constructed by.
+ */
+function isUniqueConstraintError(error: unknown) {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code: unknown }).code === "P2002"
+  );
+}
+
+/**
  * Creates a new deposit tier: adds a priced variant for it on the shop's
  * hidden deposit product (creating that product on first use), then records
  * the tier in our DB.
@@ -114,23 +256,61 @@ export async function createDepositTier(
     chargeTax?: boolean;
   },
 ) {
-  const currency = input.currency ?? "EUR";
-  const existingTiers = await listDepositTiers(shop);
+  const currency = input.currency ?? DEFAULT_CURRENCY;
 
+  // A tier in a currency the shop can't charge in is worse than useless: both
+  // functions match a product's `$app:pfand` currency against tier currencies
+  // exactly, so every product assigned to it reads as orphaned and checkout is
+  // blocked for those products. Checked here rather than only in the form,
+  // because the action is reachable by direct POST.
+  const supportedCurrencies = await ensureSupportedCurrencies(admin, shop);
+  if (!supportedCurrencies.includes(currency)) {
+    throw new Error(
+      `${currency} isn't one of this store's currencies (${supportedCurrencies.join(", ")}). Deposits can only be charged in a currency the store sells in.`,
+    );
+  }
+
+  // Deactivated tiers included, and that's load-bearing: productSet treats
+  // `variants` as the product's complete list and deletes anything left out.
+  // Sending only the active ones would destroy a deactivated tier's variant
+  // the next time any tier is added - breaking carts that already hold that
+  // deposit line, and leaving the tier pointing at a variant that's gone.
+  const existingTiers = await listAllDepositTiers(shop);
   const shopConfig = await prisma.shopConfig.findUnique({ where: { shop } });
 
   const newOptionValue = formatAmount(input.amount, currency);
 
+  // Caught before anything reaches Shopify. Letting productSet run first would
+  // mint a variant for an amount the DB then refuses on its unique index,
+  // leaving a priced variant on the deposit product with no tier behind it.
+  const duplicate = existingTiers.find(
+    (tier) => tier.amount === input.amount && tier.currency === currency,
+  );
+  if (duplicate) {
+    throw new Error(
+      duplicate.active
+        ? `A deposit amount of ${newOptionValue} already exists.`
+        : `A deposit amount of ${newOptionValue} already exists but is deactivated. Reactivate it instead of adding it again.`,
+    );
+  }
+
   // Every existing tier becomes a variant entry keyed by its known
   // variantId, so productSet updates it in place instead of deleting it.
+  // `taxable` is re-sent with each one because productSet takes the entry as
+  // the variant's whole desired state - omitting it would quietly reset every
+  // existing tier's tax treatment to Shopify's default.
   const existingVariantInputs = existingTiers.map((tier) => ({
     id: tier.variantId,
     price: (tier.amount / 100).toFixed(2),
+    taxable: tier.chargeTax,
     optionValues: [{ optionName: DEPOSIT_OPTION_NAME, name: formatAmount(tier.amount, tier.currency) }],
   }));
 
   const newVariantInput = {
     price: (input.amount / 100).toFixed(2),
+    // What the merchant ticked on the form. Without this the deposit would be
+    // taxed however Shopify defaults, regardless of what the app was told.
+    taxable: input.chargeTax ?? false,
     optionValues: [{ optionName: DEPOSIT_OPTION_NAME, name: newOptionValue }],
   };
 
@@ -197,20 +377,124 @@ export async function createDepositTier(
     });
   }
 
-  const tier = await prisma.depositTier.create({
-    data: {
-      shop,
-      amount: input.amount,
-      currency,
-      label: input.label,
-      chargeTax: input.chargeTax ?? false,
-      variantId: createdVariant.id,
-    },
-  });
+  let tier;
+  try {
+    tier = await prisma.depositTier.create({
+      data: {
+        shop,
+        amount: input.amount,
+        currency,
+        label: input.label,
+        chargeTax: input.chargeTax ?? false,
+        variantId: createdVariant.id,
+      },
+    });
+  } catch (error) {
+    // The duplicate check above catches this in every ordinary case; what's
+    // left is two tabs submitting the same amount at once. Prisma's raw text
+    // names the database index, which means nothing to a merchant.
+    if (isUniqueConstraintError(error)) {
+      throw new Error(`A deposit amount of ${newOptionValue} already exists.`);
+    }
+    throw error;
+  }
 
   await syncDepositTiersMetafield(admin, shop);
 
   return tier;
+}
+
+/**
+ * Whether this app's deposit Cart Transform is registered for the shop -
+ * which is what makes buyers actually get charged the deposit.
+ *
+ * Worth being precise about what this does and doesn't guard against.
+ * `cartTransforms` is scoped to the calling app by Shopify, so another app's
+ * bundle transform can never show up here and be mistaken for ours. What the
+ * list *can* hold is more than one of this app's own transforms, if Pfandlock
+ * ever ships a second cart transform function - so the deposit function is
+ * matched by id instead of assuming whatever is first belongs to it.
+ *
+ * Read in three places (Settings, onboarding, migration export), which is why
+ * it lives here rather than being spelled out at each one.
+ */
+export async function isDepositCartTransformActive(admin: AdminApiContext) {
+  const response = await admin.graphql(`#graphql
+    query depositCartTransform {
+      cartTransforms(first: 10) {
+        nodes {
+          id
+          functionId
+        }
+      }
+      shopifyFunctions(first: 25, apiType: "cart_transform") {
+        nodes {
+          id
+          handle
+        }
+      }
+    }`);
+  const { data } = await response.json();
+
+  const transforms: Array<{ functionId: string }> = data?.cartTransforms?.nodes ?? [];
+  const functions: Array<{ id: string; handle: string }> =
+    data?.shopifyFunctions?.nodes ?? [];
+
+  const depositFunctionIds = new Set(
+    functions
+      .filter((fn) => fn.handle === CART_TRANSFORM_FUNCTION_HANDLE)
+      .map((fn) => fn.id),
+  );
+
+  // Nothing to match against - the function isn't deployed to this
+  // environment, or the app can't see it. Since everything in `cartTransforms`
+  // belongs to this app anyway, treating any registration as ours is both
+  // safe and better than reporting "off" to a shop where it's demonstrably on.
+  if (depositFunctionIds.size === 0) {
+    return transforms.length > 0;
+  }
+
+  return transforms.some((transform) =>
+    depositFunctionIds.has(transform.functionId),
+  );
+}
+
+/**
+ * Turns a deposit tier off (or back on).
+ *
+ * Soft, deliberately. Products carry their deposit as an amount on their own
+ * metafield rather than a reference to a tier row, so deleting the row would
+ * leave every product that used it pointing at an amount with nothing behind
+ * it. Deactivating produces that same "orphaned" state on purpose - the
+ * difference is it's reversible, and the backing variant survives so carts
+ * that already hold the deposit line aren't broken.
+ *
+ * The DB write lands before the metafield sync on purpose. If the sync fails
+ * the Functions keep seeing a tier the DB calls inactive, so the shop carries
+ * on charging a deposit it meant to retire - annoying, and fixed by retrying.
+ * The other order would leave products orphaned against a tier the DB still
+ * calls active, which blocks checkout for them until someone notices.
+ */
+export async function setDepositTierActive(
+  admin: AdminApiContext,
+  shop: string,
+  tierId: string,
+  active: boolean,
+) {
+  // Scoped to the shop, not just the id: the id arrives from a form post, and
+  // DepositTier is one table shared by every shop the app is installed on.
+  const { count } = await prisma.depositTier.updateMany({
+    where: { id: tierId, shop },
+    data: { active },
+  });
+
+  if (count === 0) {
+    throw new Error("That deposit amount no longer exists.");
+  }
+
+  // The Functions read tiers from the shop metafield, never from Postgres, so
+  // nothing actually changes for a buyer until this runs.
+  await syncDepositTiersMetafield(admin, shop);
 }
 
 export type ProductDepositStatus =
@@ -391,7 +675,7 @@ export async function getDashboardSummary(
   admin: AdminApiContext,
   shop: string,
 ): Promise<DashboardSummary> {
-  const [tiers, countResponse, transformResponse, products] = await Promise.all([
+  const [tiers, countResponse, cartTransformActive, products] = await Promise.all([
     listDepositTiers(shop),
     admin.graphql(`#graphql
       query dashboardProductsCount {
@@ -399,19 +683,11 @@ export async function getDashboardSummary(
           count
         }
       }`),
-    admin.graphql(`#graphql
-      query dashboardCartTransformStatus {
-        cartTransforms(first: 1) {
-          nodes {
-            id
-          }
-        }
-      }`),
+    isDepositCartTransformActive(admin),
     listProductsWithDepositStatus(admin, shop, { first: 250 }),
   ]);
 
   const { data: countData } = await countResponse.json();
-  const { data: transformData } = await transformResponse.json();
 
   let attachingCount = 0;
   const productCountByTier = new Map<string, number>();
@@ -443,7 +719,7 @@ export async function getDashboardSummary(
     totalProductCount: countData.productsCount.count,
     attachingCount,
     orphanedProducts,
-    cartTransformActive: transformData.cartTransforms.nodes.length > 0,
+    cartTransformActive,
   };
 }
 
@@ -554,18 +830,10 @@ export async function getMigrationExport(
   admin: AdminApiContext,
   shop: string,
 ): Promise<MigrationExport> {
-  const [tiers, transformResponse] = await Promise.all([
+  const [tiers, enforcementActive] = await Promise.all([
     listDepositTiers(shop),
-    admin.graphql(`#graphql
-      query migrationCartTransform {
-        cartTransforms(first: 1) {
-          nodes {
-            id
-          }
-        }
-      }`),
+    isDepositCartTransformActive(admin),
   ]);
-  const { data: transformData } = await transformResponse.json();
 
   const { products, truncated } = await scanCatalogue(admin);
 
@@ -586,7 +854,7 @@ export async function getMigrationExport(
   return {
     version: 1,
     sourceShop: shop,
-    enforcementActive: transformData.cartTransforms.nodes.length > 0,
+    enforcementActive,
     tiers: tiers.map((tier) => ({
       amount: tier.amount,
       currency: tier.currency,
@@ -996,7 +1264,7 @@ export async function getOnboardingStatus(
   admin: AdminApiContext,
   shop: string,
 ): Promise<OnboardingStatus> {
-  const [tiers, shopConfig, fieldResponse, transformResponse, shopResponse] =
+  const [tiers, shopConfig, fieldResponse, cartTransformActive, shopResponse] =
     await Promise.all([
       listDepositTiers(shop),
       prisma.shopConfig.findUnique({ where: { shop } }),
@@ -1008,14 +1276,7 @@ export async function getOnboardingStatus(
             }
           }
         }`),
-      admin.graphql(`#graphql
-        query onboardingCartTransform {
-          cartTransforms(first: 1) {
-            nodes {
-              id
-            }
-          }
-        }`),
+      isDepositCartTransformActive(admin),
       admin.graphql(`#graphql
         query onboardingShop {
           shop {
@@ -1033,7 +1294,6 @@ export async function getOnboardingStatus(
     ]);
 
   const { data: fieldData } = await fieldResponse.json();
-  const { data: transformData } = await transformResponse.json();
   const { data: shopData } = await shopResponse.json();
 
   // The stored product id can outlive the product itself (a merchant can
@@ -1063,7 +1323,6 @@ export async function getOnboardingStatus(
   }
 
   const pfandFieldDefined = fieldData.metafieldDefinitions.nodes.length > 0;
-  const cartTransformActive = transformData.cartTransforms.nodes.length > 0;
 
   const completedSteps = [
     depositProduct !== null,
