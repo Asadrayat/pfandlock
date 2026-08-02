@@ -23,6 +23,15 @@ const liquid = fs.readFileSync(
   path.join(extensionDir, "blocks", "deposit-notice.liquid"),
   "utf8",
 );
+/**
+ * The block minus its {% comment %} blocks. Assertions about what the block
+ * *doesn't* do need this - the comments explain the wrong forms by name, so
+ * matching against the raw file would flag the explanation as the mistake.
+ */
+const liquidCode = liquid.replace(
+  /\{%-?\s*comment\s*-?%\}[\s\S]*?\{%-?\s*endcomment\s*-?%\}/g,
+  "",
+);
 const locale = JSON.parse(
   fs.readFileSync(path.join(extensionDir, "locales", "en.default.json"), "utf8"),
 );
@@ -41,15 +50,25 @@ const lookup = (key: string) =>
     );
 
 describe("deposit notice block", () => {
-  it("reads a metafield the app actually declares", () => {
-    // The block reaches for metafields.<namespace>.<key>; shopify.app.toml
-    // is what creates that field. Renaming either side leaves the notice
-    // permanently hidden rather than erroring.
-    const used = liquid.match(/metafields\.(\w+)\.(\w+)/);
-    expect(used).not.toBeNull();
+  it("reads a metafield the app actually declares, through the $app prefix", () => {
+    // shopify.app.toml's [product.metafields.app.<key>] creates the field
+    // under namespace "$app", and the reserved prefix is only reachable via
+    // the bracket form. Dot syntax (metafields.app.<key>) asks for a literal
+    // namespace named "app" and quietly resolves to nil, so this pins the
+    // bracket form as much as it pins the key. Renaming either side leaves
+    // the notice permanently hidden rather than erroring.
+    const used = liquidCode.match(/metafields\["\$app"\]\.(\w+)/);
+    expect(used, "block must read the metafield via the $app prefix").not.toBeNull();
 
-    const [, namespace, key] = used!;
-    expect(appToml).toContain(`[product.metafields.${namespace}.${key}]`);
+    const [, key] = used!;
+    expect(appToml).toContain(`[product.metafields.app.${key}]`);
+  });
+
+  it("never reaches for a metafield namespace with dot syntax", () => {
+    // The regression this file exists for: `metafields.app.pfand` parses,
+    // renders, and is wrong on every product. Nothing about it looks broken,
+    // so only an assertion catches it coming back.
+    expect(liquidCode).not.toMatch(/metafields\.\w+\.\w+/);
   });
 
   it("declares that metafield as readable from the storefront", () => {
