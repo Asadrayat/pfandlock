@@ -54,45 +54,39 @@ export default function Dashboard() {
         </s-banner>
       )}
 
+      {/*
+        Four tiles used to sit here reading €0.00 / 0 / €0.00 / 0. None of the
+        four had a data source: nothing records orders, so those were four
+        assertions the app couldn't make. One empty state until order tracking
+        lands and can derive them.
+
+        Three of the four are coming back. "Checkouts blocked" is not, and it
+        deliberately isn't described as pending: a zero there was never "no
+        data yet" but a claim about something Shopify structurally never
+        reports back to an app - a validation function's outcome reaches the
+        buyer's cart and nowhere else (see getActivitySummary in
+        deposits.server.ts). Naming it as coming soon would trade one wrong
+        number for a promise that can't be kept, so it points at the Activity
+        page, which already words the limitation correctly.
+
+        DE, for X-1 - to be used verbatim, not re-translated: "Auswertungen
+        sind noch nicht verfügbar. Pfandbuchungen und Erstattungen erscheinen
+        hier, sobald die Auftragsverfolgung aktiviert ist. Blockierte
+        Bestellvorgänge können nicht gezählt werden — Shopify meldet
+        Ergebnisse der Checkout-Prüfung nicht an Apps zurück."
+      */}
       <s-section heading="Overview">
-        <s-grid gridTemplateColumns="1fr 1fr 1fr 1fr" gap="base">
-          <s-grid-item>
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-stack direction="block" gap="small-200">
-                <s-heading>Deposits collected</s-heading>
-                <s-text type="strong">€0.00</s-text>
-                <s-text color="subdued">No orders yet</s-text>
-              </s-stack>
-            </s-box>
-          </s-grid-item>
-          <s-grid-item>
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-stack direction="block" gap="small-200">
-                <s-heading>Deposit units sold</s-heading>
-                <s-text type="strong">0</s-text>
-                <s-text color="subdued">No orders yet</s-text>
-              </s-stack>
-            </s-box>
-          </s-grid-item>
-          <s-grid-item>
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-stack direction="block" gap="small-200">
-                <s-heading>Deposits refunded</s-heading>
-                <s-text type="strong">€0.00</s-text>
-                <s-text color="subdued">No refunds yet</s-text>
-              </s-stack>
-            </s-box>
-          </s-grid-item>
-          <s-grid-item>
-            <s-box padding="base" borderWidth="base" borderRadius="base">
-              <s-stack direction="block" gap="small-200">
-                <s-heading>Checkouts blocked</s-heading>
-                <s-text type="strong">0</s-text>
-                <s-text color="subdued">Missing or mismatched deposit</s-text>
-              </s-stack>
-            </s-box>
-          </s-grid-item>
-        </s-grid>
+        <s-box padding="base" borderWidth="base" borderRadius="base">
+          <s-stack direction="block" gap="base">
+            <s-paragraph color="subdued">
+              Reporting isn&apos;t available yet. Deposit charges and refunds
+              will appear here once order tracking is switched on. Blocked
+              checkouts can&apos;t be counted — Shopify doesn&apos;t report
+              checkout validation outcomes back to apps.
+            </s-paragraph>
+            <s-link href="/app/activity">Activity &amp; alerts</s-link>
+          </s-stack>
+        </s-box>
       </s-section>
 
       <s-section heading="Deposits collected">
@@ -110,12 +104,15 @@ export default function Dashboard() {
           </s-paragraph>
         ) : (
           <s-table>
+            {/*
+              Units / Collected / Refunded used to sit alongside these two and
+              were an em dash on every row - three of five columns carrying no
+              data. They come back per tier, keyed on variantId, once orders
+              are recorded (P2-7).
+            */}
             <s-table-header-row>
               <s-table-header listSlot="primary">Amount</s-table-header>
-              <s-table-header>Applies to</s-table-header>
-              <s-table-header>Units</s-table-header>
-              <s-table-header>Collected</s-table-header>
-              <s-table-header listSlot="secondary">Refunded</s-table-header>
+              <s-table-header listSlot="secondary">Applies to</s-table-header>
             </s-table-header-row>
             <s-table-body>
               {summary.tiers.map((tier) => (
@@ -131,15 +128,6 @@ export default function Dashboard() {
                     </s-stack>
                   </s-table-cell>
                   <s-table-cell>{tier.productCount} products</s-table-cell>
-                  <s-table-cell>
-                    <s-text color="subdued">—</s-text>
-                  </s-table-cell>
-                  <s-table-cell>
-                    <s-text color="subdued">—</s-text>
-                  </s-table-cell>
-                  <s-table-cell>
-                    <s-text color="subdued">—</s-text>
-                  </s-table-cell>
                 </s-table-row>
               ))}
             </s-table-body>
