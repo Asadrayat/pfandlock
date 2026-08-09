@@ -246,6 +246,130 @@ function isUniqueConstraintError(error: unknown) {
  * new one. This is what lets a single mutation both create-the-product-if-
  * needed and add-one-variant-without-losing-the-others.
  */
+/**
+ * Inventory settings every deposit variant must carry.
+ *
+ * A deposit variant is not stock. It exists so the cart transform has a
+ * priced merchandise id to expand a line into; it is never counted, picked,
+ * or shipped on its own. But `ProductVariantSetInput.inventoryPolicy`
+ * defaults to DENY and a freshly created variant sits at 0 on hand, so the
+ * default deposit variant is out of stock and unbuyable from the moment it
+ * exists. That does not just fail quietly at checkout: because the transform
+ * expands a deposit-bearing line into components, an unbuyable component
+ * blocks the *parent product* from being added to the cart at all. Every
+ * deposit-bearing product on the store stops working until someone restocks
+ * a variant that was never meant to hold stock.
+ *
+ * `tracked: false` removes the quantity question entirely, which is the
+ * honest model for something that has no stock. CONTINUE is belt-and-braces
+ * for the case where tracking gets switched back on from the admin - then the
+ * variant is tracked but still purchasable at zero, rather than reinstating
+ * the block.
+ *
+ * Both fields are inputs only. Reading `inventoryItem { tracked }` back in
+ * the response would pull `read_inventory` into the app's scope string and
+ * force a reinstall; setting them needs only `write_products`.
+ *
+ * That `productSet` honours `inventoryItem.tracked` is worth recording,
+ * because the docs are ambiguous about it: the mutation's contract says
+ * non-list fields update only what's included, but ProductVariantSetInput
+ * describes `inventoryItem` as "used for unit cost". Confirmed empirically on
+ * API 2026-07 - a tier created through this path comes back with Track
+ * quantity off and Continue selling ticked, neither touched by hand.
+ */
+const DEPOSIT_VARIANT_INVENTORY = {
+  inventoryPolicy: "CONTINUE",
+  inventoryItem: { tracked: false },
+} as const;
+
+/** One existing tier's entry in a `productSet` variant list. */
+function existingDepositVariantInput(tier: {
+  variantId: string;
+  amount: number;
+  currency: string;
+  chargeTax: boolean;
+}) {
+  return {
+    id: tier.variantId,
+    price: (tier.amount / 100).toFixed(2),
+    taxable: tier.chargeTax,
+    ...DEPOSIT_VARIANT_INVENTORY,
+    optionValues: [
+      { optionName: DEPOSIT_OPTION_NAME, name: formatAmount(tier.amount, tier.currency) },
+    ],
+  };
+}
+
+/**
+ * The one place this app writes the deposit product's variant list.
+ *
+ * Shared rather than duplicated because of the rule in §6.1: `productSet`
+ * treats `variants` as the product's *complete* list and deletes anything
+ * omitted. Two copies of this mutation would be two chances for one of them
+ * to drift into sending a partial list and destroying live tiers' variants.
+ */
+async function writeDepositProduct(
+  admin: AdminApiContext,
+  args: {
+    depositProductId?: string | null;
+    optionValues: Array<{ name: string }>;
+    variants: Array<Record<string, unknown>>;
+  },
+) {
+  const response = await admin.graphql(
+    `#graphql
+      mutation upsertDepositProduct($input: ProductSetInput!, $identifier: ProductSetIdentifiers) {
+        productSet(input: $input, identifier: $identifier, synchronous: true) {
+          product {
+            id
+            variants(first: 50) {
+              nodes {
+                id
+                title
+              }
+            }
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }`,
+    {
+      variables: {
+        // Omitting `identifier` when the product doesn't exist yet tells
+        // productSet to create a brand new product instead of updating one.
+        identifier: args.depositProductId ? { id: args.depositProductId } : undefined,
+        input: {
+          title: DEPOSIT_PRODUCT_TITLE,
+          status: "ACTIVE",
+          productOptions: [
+            {
+              name: DEPOSIT_OPTION_NAME,
+              position: 1,
+              values: args.optionValues,
+            },
+          ],
+          variants: args.variants,
+        },
+      },
+    },
+  );
+
+  const { data } = await response.json();
+  const userErrors = data?.productSet?.userErrors ?? [];
+  if (userErrors.length > 0) {
+    throw new Error(
+      `Failed to create deposit tier: ${userErrors.map((e: { message: string }) => e.message).join(", ")}`,
+    );
+  }
+
+  return data.productSet.product as {
+    id: string;
+    variants: { nodes: Array<{ id: string; title: string }> };
+  };
+}
+
 export async function createDepositTier(
   admin: AdminApiContext,
   shop: string,
@@ -299,75 +423,41 @@ export async function createDepositTier(
   // `taxable` is re-sent with each one because productSet takes the entry as
   // the variant's whole desired state - omitting it would quietly reset every
   // existing tier's tax treatment to Shopify's default.
-  const existingVariantInputs = existingTiers.map((tier) => ({
-    id: tier.variantId,
-    price: (tier.amount / 100).toFixed(2),
-    taxable: tier.chargeTax,
-    optionValues: [{ optionName: DEPOSIT_OPTION_NAME, name: formatAmount(tier.amount, tier.currency) }],
-  }));
+  const existingVariantInputs = existingTiers.map(existingDepositVariantInput);
 
   const newVariantInput = {
     price: (input.amount / 100).toFixed(2),
     // What the merchant ticked on the form. Without this the deposit would be
     // taxed however Shopify defaults, regardless of what the app was told.
     taxable: input.chargeTax ?? false,
+    ...DEPOSIT_VARIANT_INVENTORY,
     optionValues: [{ optionName: DEPOSIT_OPTION_NAME, name: newOptionValue }],
   };
 
-  const response = await admin.graphql(
-    `#graphql
-      mutation upsertDepositProduct($input: ProductSetInput!, $identifier: ProductSetIdentifiers) {
-        productSet(input: $input, identifier: $identifier, synchronous: true) {
-          product {
-            id
-            variants(first: 50) {
-              nodes {
-                id
-                title
-              }
-            }
-          }
-          userErrors {
-            field
-            message
-          }
-        }
-      }`,
-    {
-      variables: {
-        // Omitting `identifier` when the product doesn't exist yet tells
-        // productSet to create a brand new product instead of updating one.
-        identifier: shopConfig?.depositProductId
-          ? { id: shopConfig.depositProductId }
-          : undefined,
-        input: {
-          title: DEPOSIT_PRODUCT_TITLE,
-          status: "ACTIVE",
-          productOptions: [
-            {
-              name: DEPOSIT_OPTION_NAME,
-              position: 1,
-              values: [...existingTiers.map((t) => ({ name: formatAmount(t.amount, t.currency) })), { name: newOptionValue }],
-            },
-          ],
-          variants: [...existingVariantInputs, newVariantInput],
-        },
-      },
-    },
-  );
+  const product = await writeDepositProduct(admin, {
+    depositProductId: shopConfig?.depositProductId,
+    optionValues: [
+      ...existingTiers.map((t) => ({ name: formatAmount(t.amount, t.currency) })),
+      { name: newOptionValue },
+    ],
+    variants: [...existingVariantInputs, newVariantInput],
+  });
 
-  const { data } = await response.json();
-  const userErrors = data?.productSet?.userErrors ?? [];
-  if (userErrors.length > 0) {
-    throw new Error(
-      `Failed to create deposit tier: ${userErrors.map((e: { message: string }) => e.message).join(", ")}`,
-    );
-  }
-
-  const product = data.productSet.product;
   const createdVariant = product.variants.nodes.find(
     (v: { id: string; title: string }) => v.title === newOptionValue,
   );
+
+  // The read-back matches on the option-value string (§6.1), so it fails if
+  // the string productSet echoes back isn't byte-identical to the one sent -
+  // which is what happens if the formatter behind formatAmount ever varies
+  // between two calls. Previously this went unchecked and surfaced as a
+  // TypeError on `.id` of undefined, with the tier row never written and a
+  // priced variant stranded on the deposit product.
+  if (!createdVariant) {
+    throw new Error(
+      `Shopify created the deposit variant but it couldn't be found by its label (${newOptionValue}). The amount hasn't been saved - please try again.`,
+    );
+  }
 
   if (!shopConfig?.depositProductId) {
     await prisma.shopConfig.upsert({
@@ -402,6 +492,48 @@ export async function createDepositTier(
   await syncDepositTiersMetafield(admin, shop);
 
   return tier;
+}
+
+/**
+ * Re-send every existing deposit variant so it picks up
+ * DEPOSIT_VARIANT_INVENTORY.
+ *
+ * Variants created before that setting existed are tracked with 0 on hand and
+ * a DENY policy, which blocks their parent product from being added to cart.
+ * New tiers get the fix at creation.
+ *
+ * **Nothing calls this, deliberately.** Adding any amount re-sends the
+ * complete variant list, so ordinary use repairs older variants as a side
+ * effect and no merchant-facing repair control has to exist for a bug that
+ * cannot recur once creation is correct. This is kept for an out-of-band
+ * one-off - a script against a shop that has the stale variants and no reason
+ * to add an amount. If that need never materialises, delete it.
+ *
+ * Idempotent, and a no-op rather than an error when there are no tiers or no
+ * deposit product: an empty variant list would delete every variant on the
+ * product.
+ *
+ * Deactivated tiers are included deliberately (§6.1): `productSet` deletes
+ * any variant omitted from the list, and a deactivated tier's variant may
+ * still be sitting in a live cart.
+ */
+export async function repairDepositVariantInventory(
+  admin: AdminApiContext,
+  shop: string,
+): Promise<{ repaired: number }> {
+  const shopConfig = await prisma.shopConfig.findUnique({ where: { shop } });
+  if (!shopConfig?.depositProductId) return { repaired: 0 };
+
+  const tiers = await listAllDepositTiers(shop);
+  if (tiers.length === 0) return { repaired: 0 };
+
+  await writeDepositProduct(admin, {
+    depositProductId: shopConfig.depositProductId,
+    optionValues: tiers.map((t) => ({ name: formatAmount(t.amount, t.currency) })),
+    variants: tiers.map(existingDepositVariantInput),
+  });
+
+  return { repaired: tiers.length };
 }
 
 /**

@@ -38,6 +38,7 @@ import {
   listDepositTiers,
   previewMigrationImport,
   readSupportedCurrencies,
+  repairDepositVariantInventory,
   resolveDepositStatus,
   setDepositTierActive,
   setProductDeposit,
@@ -1904,6 +1905,8 @@ describe("createDepositTier", () => {
     id?: string;
     price: string;
     taxable: boolean;
+    inventoryPolicy?: string;
+    inventoryItem?: { tracked?: boolean };
     optionValues: Array<{ optionName: string; name: string }>;
   }
 
@@ -2243,6 +2246,48 @@ describe("createDepositTier", () => {
     ).toEqual([true, false, false]);
   });
 
+  it("makes the new deposit variant purchasable at zero stock", async () => {
+    // A deposit variant holds no stock, but productSet defaults
+    // inventoryPolicy to DENY and a new variant starts at 0 on hand. Left
+    // alone, the variant is out of stock and unbuyable the moment it exists -
+    // and because the cart transform expands a deposit-bearing line into
+    // components, an unbuyable component blocks the *parent product* from
+    // being added to cart at all. Every deposit-bearing product on the store
+    // stops working until someone restocks a variant that never held stock.
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+    });
+
+    await createDepositTier(store.admin, SHOP, { amount: 8 });
+
+    const [variant] = store.productSetCalls[0].input.variants;
+    expect(variant.inventoryPolicy).toBe("CONTINUE");
+    expect(variant.inventoryItem?.tracked).toBe(false);
+  });
+
+  it("carries the same inventory settings on every re-sent variant", async () => {
+    // The re-send is what backfills variants minted before this was fixed:
+    // productSet takes each entry as that variant's whole desired state, so
+    // adding any amount repairs the rest. Omitting the fields here would do
+    // the reverse and quietly re-block every existing tier.
+    const store = fakeDepositProduct({
+      depositProductId: "gid://shopify/Product/deposit",
+      tiers: [
+        tierRow(8, { variantId: "gid://shopify/ProductVariant/8" }),
+        tierRow(15, { variantId: "gid://shopify/ProductVariant/15" }),
+      ],
+    });
+
+    await createDepositTier(store.admin, SHOP, { amount: 25 });
+
+    const { variants } = store.productSetCalls[0].input;
+    expect(variants).toHaveLength(3);
+    for (const variant of variants) {
+      expect(variant.inventoryPolicy).toBe("CONTINUE");
+      expect(variant.inventoryItem?.tracked).toBe(false);
+    }
+  });
+
   it("re-sends a deactivated tier's variant too", async () => {
     // productSet deletes any variant left out of the list. Sending only the
     // active tiers would destroy a deactivated one's variant the next time
@@ -2461,6 +2506,80 @@ describe("createDepositTier", () => {
 
     // Nothing recorded locally that Shopify doesn't have.
     expect(createTierRow).not.toHaveBeenCalled();
+  });
+
+  // Nested so it can reuse fakeDepositProduct: repair writes the same
+  // productSet call createDepositTier does, just without adding an amount.
+  describe("repairDepositVariantInventory", () => {
+    it("re-sends every tier so existing variants become purchasable", async () => {
+      // The backfill for variants minted before the inventory settings
+      // existed. Those sit tracked at 0 on hand under a DENY policy, which
+      // blocks their parent products from being added to cart.
+      const store = fakeDepositProduct({
+        depositProductId: "gid://shopify/Product/deposit",
+        tiers: [
+          tierRow(8, { variantId: "gid://shopify/ProductVariant/8" }),
+          tierRow(25, { variantId: "gid://shopify/ProductVariant/25" }),
+        ],
+      });
+
+      const result = await repairDepositVariantInventory(store.admin, SHOP);
+
+      expect(result).toEqual({ repaired: 2 });
+      const { variants } = store.productSetCalls[0].input;
+      expect(variants.map((variant) => variant.id)).toEqual([
+        "gid://shopify/ProductVariant/8",
+        "gid://shopify/ProductVariant/25",
+      ]);
+      for (const variant of variants) {
+        expect(variant.inventoryPolicy).toBe("CONTINUE");
+        expect(variant.inventoryItem?.tracked).toBe(false);
+      }
+    });
+
+    it("includes deactivated tiers in the re-sent list", async () => {
+      // Same §6.1 rule as everywhere else: productSet deletes any variant
+      // left out. A repair that dropped deactivated tiers would destroy the
+      // variants of carts already holding them - the exact opposite of a fix.
+      const store = fakeDepositProduct({
+        depositProductId: "gid://shopify/Product/deposit",
+        tiers: [
+          tierRow(8, { variantId: "gid://shopify/ProductVariant/8", active: false }),
+          tierRow(25, { variantId: "gid://shopify/ProductVariant/25" }),
+        ],
+      });
+
+      await repairDepositVariantInventory(store.admin, SHOP);
+
+      expect(
+        store.productSetCalls[0].input.variants.map((variant) => variant.id),
+      ).toEqual([
+        "gid://shopify/ProductVariant/8",
+        "gid://shopify/ProductVariant/25",
+      ]);
+    });
+
+    it("does nothing on a shop with no deposit product", async () => {
+      // Clicking repair before configuring anything must not mint a product.
+      const store = fakeDepositProduct();
+
+      const result = await repairDepositVariantInventory(store.admin, SHOP);
+
+      expect(result).toEqual({ repaired: 0 });
+      expect(store.productSetCalls).toHaveLength(0);
+    });
+
+    it("does nothing when the product exists but has no tiers", async () => {
+      // An empty variant list would delete every variant on the product.
+      const store = fakeDepositProduct({
+        depositProductId: "gid://shopify/Product/deposit",
+      });
+
+      const result = await repairDepositVariantInventory(store.admin, SHOP);
+
+      expect(result).toEqual({ repaired: 0 });
+      expect(store.productSetCalls).toHaveLength(0);
+    });
   });
 });
 
