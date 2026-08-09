@@ -163,12 +163,23 @@ export default function Migration() {
           </s-stack>
         </s-stack>
 
+        {/*
+          The figure is MIGRATION_PRODUCT_SCAN_LIMIT in deposits.server.ts.
+          "More products than the export scans in one pass" told a merchant
+          they were affected without telling them whether they were - most
+          catalogues are nowhere near this, and the ones that are need to
+          know by how much. Keep the two in step if the limit ever moves.
+
+          DE, for X-1 - to be used verbatim, not re-translated: „Es wurden nur
+          die ersten 5.000 Produkte erfasst. Darüber hinausgehende Produkte
+          sind nicht im Export enthalten."
+        */}
         {data.truncated && (
           <s-banner tone="warning" heading="Export is incomplete">
             <s-paragraph>
-              This store has more products than the export scans in one pass,
-              so some assignments are missing. Migrate the remainder by hand
-              after importing this file.
+              Only the first 5,000 products were scanned. Products beyond this
+              limit aren&apos;t included in the export. Migrate the remainder
+              by hand after importing this file.
             </s-paragraph>
           </s-banner>
         )}
@@ -270,11 +281,17 @@ export default function Migration() {
               </s-banner>
             )}
 
+            {/*
+              Same limit as the export banner above, but this one is about
+              scanning *this* store to match the file against, so only the
+              count sentence carries over - nothing here is being exported.
+            */}
             {plan.destinationTruncated && (
               <s-banner tone="warning" heading="This store's catalogue is large">
                 <s-paragraph>
-                  Not every product here was scanned, so some matches may be
-                  missed. Check the unmatched list carefully before applying.
+                  Only the first 5,000 products were scanned, so some matches
+                  may be missed. Check the unmatched list carefully before
+                  applying.
                 </s-paragraph>
               </s-banner>
             )}

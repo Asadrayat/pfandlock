@@ -789,7 +789,12 @@ export async function setProductDeposit(
   }
 }
 
-/** Hard ceiling on the export's product scan - a runaway-pagination guard. */
+/**
+ * Hard ceiling on the export's product scan - a runaway-pagination guard.
+ *
+ * Named to the merchant in both truncation banners on app.migration.tsx, so
+ * a change here is a copy change there too.
+ */
 const MIGRATION_PRODUCT_SCAN_LIMIT = 5000;
 
 export interface MigrationExport {
