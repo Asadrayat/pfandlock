@@ -72,9 +72,16 @@ export default function Activity() {
           <s-grid-item>
             <s-box padding="base" borderWidth="base" borderRadius="base">
               <s-stack direction="block" gap="small-200">
+                {/*
+                  Not 0. Nothing anywhere logs an app error, so a zero here
+                  would read as "we checked and found none" when in fact
+                  nothing was ever counted - the same claim the other two
+                  tiles avoid by rendering an em dash. Becomes a real figure
+                  once handler failures are recorded (P2-8).
+                */}
                 <s-heading>Errors</s-heading>
-                <s-text type="strong">0</s-text>
-                <s-text color="subdued">No errors logged yet</s-text>
+                <s-text type="strong">—</s-text>
+                <s-text color="subdued">Not tracked yet</s-text>
               </s-stack>
             </s-box>
           </s-grid-item>
