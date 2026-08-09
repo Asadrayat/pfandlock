@@ -11,15 +11,13 @@ import { authenticate } from "../shopify.server";
 import { listProductsWithDepositStatus } from "app/deposits.server";
 import { formatAmount, idFromGid } from "app/deposits.shared";
 
-
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
 
   const products = await listProductsWithDepositStatus(admin, session.shop, {
     first: 25,
   });
-  // console.log(products);
-  
+
   return { products };
 };
 

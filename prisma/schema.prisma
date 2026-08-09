@@ -65,8 +65,10 @@ model ShopConfig {
 // table is metadata *about* that variant, not a separate source of price truth.
 //
 // Product-to-tier assignment is NOT stored here. It lives on the product's
-// own `custom.pfand` metafield (declared in shopify.app.toml), so the
-// storefront and any other reader can see it without going through our app.
+// own `$app:pfand` metafield - shopify.app.toml declares it as
+// [product.metafields.app.pfand], and the reserved `$app` prefix is the
+// namespace that produces - so the storefront and any other reader can see
+// it without going through our app.
 // We only look up tiers by amount to tell whether a product's metafield
 // value has a configured tier behind it or is "orphaned".
 model DepositTier {

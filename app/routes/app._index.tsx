@@ -1,11 +1,11 @@
 // Dashboard ("Overview") - the app's home route. A derived view: everything
 // here reads real state (deposit tiers, product pfand metafields, Cart
 // Transform activation) via deposits.server.ts. Order-derived numbers
-// (collected/refunded/blocked) have no data source yet - Activity tracking
-// isn't built - so those render an explicit empty state instead of fake
-// figures. See pfand-app-ui.html route "dashboard" for the design this
-// follows; the money/units/blocked-checkout metrics there are illustrative
-// mock data, not a contract to reproduce before the data exists.
+// (collected/refunded) have no data source yet - order tracking isn't built
+// - so those render an explicit empty state instead of fake figures.
+// Blocked checkouts are not in that set: they are unobservable rather than
+// pending, and the Overview section below says so rather than promising a
+// figure that can never arrive.
 import type { HeadersFunction, LoaderFunctionArgs } from "react-router";
 import { useLoaderData } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
