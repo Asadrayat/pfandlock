@@ -37,10 +37,11 @@ export default function Onboarding() {
         heading="Deposits stay attached, even to a tampered cart"
       >
         <s-paragraph>
-          Shopify splits each deposit product into two parts on its own
-          servers, so the deposit isn&apos;t a line a buyer can delete. A
-          second check blocks checkout — including Shop Pay and Google Pay —
-          if a deposit is ever missing.
+          Shopify adds the deposit as its own priced component of the
+          product&apos;s line, on its own servers, so it isn&apos;t something a
+          buyer can delete on the way to checkout. A second check blocks
+          checkout — including Shop Pay and Google Pay — if a deposit is ever
+          missing.
         </s-paragraph>
       </s-banner>
 
@@ -212,8 +213,9 @@ export default function Onboarding() {
 
       <s-section slot="aside" heading="What buyers will see">
         <s-paragraph color="subdued">
-          The deposit is part of the product&apos;s line, not a separate line
-          the buyer can delete.
+          The deposit shows as its own row beneath the product, charged on top
+          of the product&apos;s price. It belongs to that product&apos;s line,
+          so it can&apos;t be removed on its own.
         </s-paragraph>
       </s-section>
     </s-page>
