@@ -8,6 +8,9 @@
           {
             "id": "gid://shopify/CartLine/1",
             "quantity": 1,
+            "cost": {
+              "amountPerQuantity": { "amount": "10.00", "currencyCode": "EUR" }
+            },
             "merchandise": {
               "__typename": "ProductVariant",
               "id": "gid://shopify/ProductVariant/1",

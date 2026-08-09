@@ -12,15 +12,30 @@ import { cartTransformRun } from "../src/cart_transform_run";
 
 type Line = CartTransformRunInput["cart"]["lines"][number];
 
+/**
+ * `unitPrice` is the parent's own per-unit price, which the expand has to
+ * restate on the product component - without it Shopify distributes the
+ * parent's price across the components instead of adding the deposit on top.
+ * A major-unit decimal string, as the Decimal scalar is serialized.
+ */
 const variantLine = (options: {
   id?: string;
   quantity?: number;
   variantId?: string;
+  unitPrice?: string;
   pfand?: { amount: string; currency_code: string } | null;
 }): Line => ({
   __typename: "CartLine",
   id: options.id ?? "gid://shopify/CartLine/1",
   quantity: options.quantity ?? 1,
+  cost: {
+    __typename: "CartLineCost",
+    amountPerQuantity: {
+      __typename: "MoneyV2",
+      amount: options.unitPrice ?? "10.00",
+      currencyCode: "EUR" as Line["cost"]["amountPerQuantity"]["currencyCode"],
+    },
+  },
   merchandise: {
     __typename: "ProductVariant",
     id: options.variantId ?? "gid://shopify/ProductVariant/1",
@@ -38,6 +53,14 @@ const customLine = (id = "gid://shopify/CartLine/custom"): Line => ({
   __typename: "CartLine",
   id,
   quantity: 1,
+  cost: {
+    __typename: "CartLineCost",
+    amountPerQuantity: {
+      __typename: "MoneyV2",
+      amount: "10.00",
+      currencyCode: "EUR" as Line["cost"]["amountPerQuantity"]["currencyCode"],
+    },
+  },
   merchandise: { __typename: "CustomProduct" },
 });
 
@@ -63,7 +86,12 @@ describe("cartTransformRun", () => {
   it("expands a line whose deposit matches a configured tier", () => {
     const result = cartTransformRun(
       input(
-        [variantLine({ pfand: { amount: "0.08", currency_code: "EUR" } })],
+        [
+          variantLine({
+            unitPrice: "699.95",
+            pfand: { amount: "0.08", currency_code: "EUR" },
+          }),
+        ],
         [EIGHT_CENT_TIER],
       ),
     );
@@ -74,13 +102,101 @@ describe("cartTransformRun", () => {
           lineExpand: {
             cartLineId: "gid://shopify/CartLine/1",
             expandedCartItems: [
-              { merchandiseId: "gid://shopify/ProductVariant/1", quantity: 1 },
-              { merchandiseId: "gid://shopify/ProductVariant/deposit-8", quantity: 1 },
+              {
+                merchandiseId: "gid://shopify/ProductVariant/1",
+                quantity: 1,
+                price: { adjustment: { fixedPricePerUnit: { amount: "699.95" } } },
+              },
+              {
+                merchandiseId: "gid://shopify/ProductVariant/deposit-8",
+                quantity: 1,
+                price: { adjustment: { fixedPricePerUnit: { amount: "0.08" } } },
+              },
             ],
           },
         },
       ],
     });
+  });
+
+  it("adds the deposit on top instead of carving it out of the product", () => {
+    // The defect this pricing exists for. With no price on the components,
+    // Shopify distributes the parent line's price across them: a EUR 699.95
+    // product plus a EUR 0.08 deposit totalled EUR 699.95, the Pfand line
+    // showing 0,08 EUR while taking those 8 cents out of the product. The
+    // deposit was displayed and never charged, on four live checkouts.
+    const result = cartTransformRun(
+      input(
+        [
+          variantLine({
+            unitPrice: "699.95",
+            pfand: { amount: "0.08", currency_code: "EUR" },
+          }),
+        ],
+        [EIGHT_CENT_TIER],
+      ),
+    );
+
+    const items = result.operations[0].lineExpand!.expandedCartItems;
+    const total = items.reduce(
+      (sum, item) =>
+        sum + Math.round(parseFloat(item.price!.adjustment.fixedPricePerUnit!.amount) * 100),
+      0,
+    );
+
+    expect(total).toBe(70003); // EUR 700.03, not EUR 699.95
+  });
+
+  it("prices the deposit component from the tier, in major units", () => {
+    // The tier config is minor units (8) and the price field takes a
+    // major-unit decimal string, so this is the one component that needs
+    // converting. Sending "8" would charge EUR 8.00 of Pfand.
+    const result = cartTransformRun(
+      input(
+        [variantLine({ pfand: { amount: "0.25", currency_code: "EUR" } })],
+        [{ amount: 25, currency: "EUR", variantId: "gid://shopify/ProductVariant/deposit-25" }],
+      ),
+    );
+
+    const deposit = result.operations[0].lineExpand!.expandedCartItems[1];
+    expect(deposit.price!.adjustment.fixedPricePerUnit!.amount).toBe("0.25");
+  });
+
+  it("passes the parent's price through untouched", () => {
+    // Restating the parent's own price is what keeps it whole. Reformatting
+    // it - parsing to a float and back - would risk changing a value we have
+    // no business changing.
+    const result = cartTransformRun(
+      input(
+        [
+          variantLine({
+            unitPrice: "1.005",
+            pfand: { amount: "0.08", currency_code: "EUR" },
+          }),
+        ],
+        [EIGHT_CENT_TIER],
+      ),
+    );
+
+    const product = result.operations[0].lineExpand!.expandedCartItems[0];
+    expect(product.price!.adjustment.fixedPricePerUnit!.amount).toBe("1.005");
+  });
+
+  it("does not expand when the parent's unit price is unreadable", () => {
+    // Both components have to be priced or Shopify goes back to distributing,
+    // so a line with no readable price must not expand at all. The product
+    // then has no deposit attached, which the Checkout Validation function
+    // catches as an orphan - a blocked checkout with an actionable message,
+    // rather than a silently wrong total.
+    const line = variantLine({ pfand: { amount: "0.08", currency_code: "EUR" } });
+    // No ts-expect-error needed, and that is the point: codegen maps the
+    // Decimal scalar to `any`, so assigning null here typechecks cleanly.
+    // Nothing in the type system defends this field - only the guard does.
+    line.cost.amountPerQuantity.amount = null;
+
+    const result = cartTransformRun(input([line], [EIGHT_CENT_TIER]));
+
+    expect(result.operations).toEqual([]);
   });
 
   it("keeps the product itself in the expanded list", () => {

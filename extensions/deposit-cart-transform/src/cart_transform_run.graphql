@@ -3,6 +3,18 @@ query CartTransformRunInput {
     lines {
       id
       quantity
+      # The parent's own unit price, needed because expandedCartItems has to
+      # state a fixed price for every component. ProductVariant carries no
+      # price field in this schema, so the cart line's cost is the only place
+      # to read it. amountPerQuantity is per unit, which is what
+      # fixedPricePerUnit expects - subtotalAmount and totalAmount are line
+      # totals and would multiply the price by the quantity twice.
+      cost {
+        amountPerQuantity {
+          amount
+          currencyCode
+        }
+      }
       merchandise {
         __typename
         ... on ProductVariant {

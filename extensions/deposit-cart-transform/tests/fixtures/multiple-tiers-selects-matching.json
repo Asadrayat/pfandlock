@@ -8,6 +8,9 @@
           {
             "id": "gid://shopify/CartLine/1",
             "quantity": 1,
+            "cost": {
+              "amountPerQuantity": { "amount": "20.00", "currencyCode": "EUR" }
+            },
             "merchandise": {
               "__typename": "ProductVariant",
               "id": "gid://shopify/ProductVariant/1",
@@ -38,11 +41,13 @@
             "expandedCartItems": [
               {
                 "merchandiseId": "gid://shopify/ProductVariant/1",
-                "quantity": 1
+                "quantity": 1,
+                "price": { "adjustment": { "fixedPricePerUnit": { "amount": "20.00" } } }
               },
               {
                 "merchandiseId": "gid://shopify/ProductVariant/999",
-                "quantity": 1
+                "quantity": 1,
+                "price": { "adjustment": { "fixedPricePerUnit": { "amount": "0.15" } } }
               }
             ]
           }

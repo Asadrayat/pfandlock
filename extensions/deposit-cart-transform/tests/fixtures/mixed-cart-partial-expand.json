@@ -8,6 +8,9 @@
           {
             "id": "gid://shopify/CartLine/1",
             "quantity": 1,
+            "cost": {
+              "amountPerQuantity": { "amount": "5.00", "currencyCode": "EUR" }
+            },
             "merchandise": {
               "__typename": "ProductVariant",
               "id": "gid://shopify/ProductVariant/1",
@@ -21,6 +24,9 @@
           {
             "id": "gid://shopify/CartLine/2",
             "quantity": 1,
+            "cost": {
+              "amountPerQuantity": { "amount": "3.00", "currencyCode": "EUR" }
+            },
             "merchandise": {
               "__typename": "ProductVariant",
               "id": "gid://shopify/ProductVariant/2",
@@ -32,6 +38,9 @@
           {
             "id": "gid://shopify/CartLine/3",
             "quantity": 1,
+            "cost": {
+              "amountPerQuantity": { "amount": "12.50", "currencyCode": "EUR" }
+            },
             "merchandise": {
               "__typename": "ProductVariant",
               "id": "gid://shopify/ProductVariant/3",
@@ -45,6 +54,9 @@
           {
             "id": "gid://shopify/CartLine/4",
             "quantity": 1,
+            "cost": {
+              "amountPerQuantity": { "amount": "1.00", "currencyCode": "EUR" }
+            },
             "merchandise": {
               "__typename": "CustomProduct"
             }
@@ -52,6 +64,9 @@
           {
             "id": "gid://shopify/CartLine/5",
             "quantity": 1,
+            "cost": {
+              "amountPerQuantity": { "amount": "5.00", "currencyCode": "EUR" }
+            },
             "merchandise": {
               "__typename": "ProductVariant",
               "id": "gid://shopify/ProductVariant/5",
@@ -80,11 +95,13 @@
             "expandedCartItems": [
               {
                 "merchandiseId": "gid://shopify/ProductVariant/1",
-                "quantity": 1
+                "quantity": 1,
+                "price": { "adjustment": { "fixedPricePerUnit": { "amount": "5.00" } } }
               },
               {
                 "merchandiseId": "gid://shopify/ProductVariant/999",
-                "quantity": 1
+                "quantity": 1,
+                "price": { "adjustment": { "fixedPricePerUnit": { "amount": "0.08" } } }
               }
             ]
           }
@@ -95,11 +112,13 @@
             "expandedCartItems": [
               {
                 "merchandiseId": "gid://shopify/ProductVariant/5",
-                "quantity": 1
+                "quantity": 1,
+                "price": { "adjustment": { "fixedPricePerUnit": { "amount": "5.00" } } }
               },
               {
                 "merchandiseId": "gid://shopify/ProductVariant/999",
-                "quantity": 1
+                "quantity": 1,
+                "price": { "adjustment": { "fixedPricePerUnit": { "amount": "0.08" } } }
               }
             ]
           }
