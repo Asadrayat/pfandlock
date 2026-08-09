@@ -12,9 +12,15 @@ import { defineConfig } from "vitest/config";
 // deposit-notice is the exception. It's a theme extension with no package
 // of its own and nothing to build - its tests only read files - so this is
 // the only runner it has.
+//
+// Its tests live in a *sibling* directory, deposit-notice.tests, rather than
+// inside the extension. A theme app extension may only contain assets/,
+// blocks/, snippets/ and locales/, and everything under its root is uploaded
+// to the storefront - so a tests/ directory in there ships test source to
+// merchants. Keep the include below pointed at the sibling.
 export default defineConfig({
   test: {
-    include: ["app/**/*.test.ts", "extensions/deposit-notice/**/*.test.ts"],
+    include: ["app/**/*.test.ts", "extensions/deposit-notice.tests/**/*.test.ts"],
     environment: "node",
   },
 });

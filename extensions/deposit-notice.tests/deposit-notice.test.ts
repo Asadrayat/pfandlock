@@ -15,8 +15,12 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { describe, expect, it } from "vitest";
 
+// This file sits beside the extension, not inside it: everything under a
+// theme app extension's root is uploaded to the storefront, and the only
+// directories one may contain are assets/, blocks/, snippets/ and locales/.
+// So the extension has to be named rather than derived from here's parent.
 const here = path.dirname(fileURLToPath(import.meta.url));
-const extensionDir = path.dirname(here);
+const extensionDir = path.resolve(here, "..", "deposit-notice");
 const repoRoot = path.resolve(extensionDir, "..", "..");
 
 const liquid = fs.readFileSync(
