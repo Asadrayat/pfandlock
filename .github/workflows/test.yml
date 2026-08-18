@@ -26,18 +26,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Before setup-node, so its `cache: pnpm` can find the store.
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11
-
       - uses: actions/setup-node@v4
         with:
           # Matches the `engines` range in package.json.
           node-version: 22
-          cache: pnpm
+          cache: npm
 
-      - run: pnpm install --frozen-lockfile
+      - run: npm ci
 
       # The wasm suites shell out to a globally installed `shopify` binary -
       # `@shopify/shopify-function-test-helpers` runs `shopify app function
@@ -57,18 +52,18 @@ jobs:
           shopify app function typegen --path extensions/deposit-checkout-validation
 
       - name: Generate Prisma client
-        run: pnpm exec prisma generate
+        run: npm exec prisma generate
 
       - name: Lint
-        run: pnpm run lint
+        run: npm run lint
 
       - name: Typecheck
-        run: pnpm run typecheck
+        run: npm run typecheck
 
       - name: Test (app)
-        run: pnpm run test
+        run: npm run test
 
       # The two function extensions, each of which compiles its source to wasm
       # and runs the committed fixtures through the real module.
       - name: Test (functions)
-        run: pnpm run test:extensions
+        run: npm run test:extensions

@@ -15,7 +15,15 @@ const shopify = shopifyApp({
   scopes: process.env.SCOPES?.split(","),
   appUrl: process.env.SHOPIFY_APP_URL || "",
   authPathPrefix: "/auth",
-  sessionStorage: new PrismaSessionStorage(prisma),
+  // Defaults are 2 retries / 5s apart (~10s total) before giving up and
+  // throwing a "table does not exist" error - too tight for a cold first
+  // connection to a pooled/serverless Postgres instance at process boot,
+  // where the table is actually fine but the connection just hasn't warmed
+  // up yet. Give it more room to ride that out.
+  sessionStorage: new PrismaSessionStorage(prisma, {
+    connectionRetries: 6,
+    connectionRetryIntervalMs: 3000,
+  }),
   distribution: AppDistribution.AppStore,
   future: {
     expiringOfflineAccessTokens: true,

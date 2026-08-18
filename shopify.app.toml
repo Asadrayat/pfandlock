@@ -1,7 +1,7 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
 client_id = "a1dd92316574d0b4f46a31c984c364ae"
-application_url = "https://example.com"
+application_url = "http://localhost:3000"
 embedded = true
 name = "Pfandlock"
 

@@ -20,7 +20,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:extensions": "pnpm --recursive run test"
+    "test:extensions": "npm run test --workspaces --if-present"
   },
   "type": "module",
   "engines": {
@@ -68,9 +68,6 @@
   },
   "workspaces": [
     "extensions/*"
-  ],
-  "trustedDependencies": [
-    "@shopify/plugin-cloudflare"
   ],
   "overrides": {
     "p-map": "^4.0.0"
