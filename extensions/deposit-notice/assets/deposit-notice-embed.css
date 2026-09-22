@@ -1,0 +1,20 @@
+/* Two placements deposit-notice-embed.js can choose between - see its
+   comment for why an app embed needs a JS repositioning step at all. */
+
+.pfandlock-deposit-embed--inline {
+  margin: 0 0 1em;
+  font-size: 0.9em;
+}
+
+.pfandlock-deposit-embed--banner {
+  position: fixed;
+  inset-inline: 0;
+  inset-block-end: 0;
+  z-index: 999;
+  margin: 0;
+  padding: 0.75em 1em;
+  text-align: center;
+  font-size: 0.9em;
+  background: #f4f4f4;
+  border-top: 1px solid #ddd;
+}

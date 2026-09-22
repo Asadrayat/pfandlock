@@ -10,13 +10,19 @@ import { useFetcher, useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
 import {
   CART_TRANSFORM_FUNCTION_HANDLE,
+  getDepositNoticeEmbedStatus,
   isDepositCartTransformActive,
 } from "../deposits.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
 
-  return { enabled: await isDepositCartTransformActive(admin) };
+  const [enabled, depositNoticeEmbed] = await Promise.all([
+    isDepositCartTransformActive(admin),
+    getDepositNoticeEmbedStatus(admin, session.shop),
+  ]);
+
+  return { enabled, depositNoticeEmbed };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -49,7 +55,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function Settings() {
-  const { enabled } = useLoaderData<typeof loader>();
+  const { enabled, depositNoticeEmbed } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const isSubmitting = fetcher.state === "submitting";
   const isEnabled = enabled || fetcher.data?.ok === true;
@@ -96,10 +102,35 @@ export default function Settings() {
 
       <s-section heading="Storefront deposit notice">
         <s-paragraph>
-          Add the &quot;Deposit notice&quot; block to your product template
-          from the theme editor (Online Store &gt; Customize) so buyers see a
-          product&apos;s deposit amount before they add it to cart, instead
-          of only at checkout.
+          Turn this on so buyers see a product&apos;s deposit amount before
+          they add it to cart, instead of only at checkout. Pfandlock tries
+          to place the notice right next to the buy button; on themes it
+          can&apos;t recognize, it falls back to a banner at the bottom of
+          the page.
+        </s-paragraph>
+
+        {depositNoticeEmbed.enabled === true && (
+          <s-badge tone="success">Enabled</s-badge>
+        )}
+        {depositNoticeEmbed.enabled === false && (
+          <s-badge>Not enabled</s-badge>
+        )}
+        {depositNoticeEmbed.enabled === null && (
+          <s-badge tone="warning">Status unknown</s-badge>
+        )}
+
+        <s-button href={depositNoticeEmbed.themeEditorUrl} target="_blank">
+          Open theme editor
+        </s-button>
+
+        <s-paragraph>
+          That button opens your theme editor&apos;s App embeds panel with
+          &quot;Pfandlock deposit notice&quot; focused - only a merchant can
+          flip that switch, from inside the theme editor, so this is as
+          close as the app can get to doing it for you. Prefer the notice in
+          one exact spot on a specific template instead? Add the
+          &quot;Deposit notice&quot; block there instead of using the embed
+          toggle.
         </s-paragraph>
       </s-section>
 

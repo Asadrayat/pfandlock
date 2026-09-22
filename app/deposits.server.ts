@@ -592,6 +592,113 @@ export async function isDepositCartTransformActive(admin: AdminApiContext) {
 }
 
 /**
+ * deposit-notice's shopify.extension.toml `uid` - a settings_data.json entry
+ * for one of its blocks carries a `type` of
+ * `shopify://apps/{app-handle}/blocks/{block-handle}/{this-uid}`. Matching
+ * on this (plus the block handle) rather than the app handle means
+ * detection below doesn't need to know the app's Partners-assigned handle.
+ */
+const DEPOSIT_NOTICE_EXTENSION_UID = "edcc817c-0c35-78e0-a7ad-0637c6b35d519e1a4812";
+
+/** Filename (minus .liquid) of the global app-embed counterpart to the
+ * manually-placed "Deposit notice" section block - see
+ * extensions/deposit-notice/blocks/deposit-notice-embed.liquid. */
+const DEPOSIT_NOTICE_EMBED_HANDLE = "deposit-notice-embed";
+
+export interface DepositNoticeEmbedStatus {
+  /**
+   * Whether the embed is on for the shop's current theme. `null` means
+   * "couldn't tell" - no main theme, a GraphQL error, unparsable theme
+   * JSON - rather than "off"; Settings renders that as "Status unknown"
+   * instead of a false "Not enabled".
+   */
+  enabled: boolean | null;
+  /**
+   * Deep link into the theme editor's App embeds panel, focused on this
+   * embed, ready for a merchant to flip on themselves - that toggle has no
+   * Admin API equivalent, so a deep link is the closest this app can get to
+   * doing it for them.
+   */
+  themeEditorUrl: string;
+}
+
+/**
+ * Whether the "Pfandlock deposit notice" app embed is switched on for the
+ * shop's current (main) theme, plus a deep link into the theme editor so a
+ * merchant can turn it on.
+ *
+ * Reads config/settings_data.json off the main theme (requires the
+ * read_themes scope) rather than anything this app writes itself - the
+ * embed's on/off state lives entirely in the merchant's theme, set only by
+ * them, in the theme editor.
+ */
+export async function getDepositNoticeEmbedStatus(
+  admin: AdminApiContext,
+  shop: string,
+): Promise<DepositNoticeEmbedStatus> {
+  const themeEditorUrl =
+    `https://${shop}/admin/themes/current/editor` +
+    `?context=apps&template=product` +
+    `&activateAppId=${process.env.SHOPIFY_API_KEY}/${DEPOSIT_NOTICE_EMBED_HANDLE}`;
+
+  try {
+    const themeResponse = await admin.graphql(`#graphql
+      query mainTheme {
+        themes(first: 1, roles: [MAIN]) {
+          nodes {
+            id
+          }
+        }
+      }`);
+    const { data: themeData } = await themeResponse.json();
+    const themeId: string | undefined = themeData?.themes?.nodes?.[0]?.id;
+    if (!themeId) return { enabled: null, themeEditorUrl };
+
+    const fileResponse = await admin.graphql(
+      `#graphql
+        query themeSettingsData($themeId: ID!) {
+          theme(id: $themeId) {
+            files(filenames: ["config/settings_data.json"], first: 1) {
+              nodes {
+                body {
+                  ... on OnlineStoreThemeFileBodyText {
+                    content
+                  }
+                }
+              }
+            }
+          }
+        }`,
+      { variables: { themeId } },
+    );
+    const { data: fileData } = await fileResponse.json();
+    const content: string | undefined =
+      fileData?.theme?.files?.nodes?.[0]?.body?.content;
+    if (!content) return { enabled: null, themeEditorUrl };
+
+    const settings = JSON.parse(content);
+    const blocks: Record<string, { type?: string; disabled?: boolean }> =
+      settings?.current?.blocks ?? {};
+    const ourBlock = Object.values(blocks).find((block) =>
+      block?.type?.includes(
+        `/blocks/${DEPOSIT_NOTICE_EMBED_HANDLE}/${DEPOSIT_NOTICE_EXTENSION_UID}`,
+      ),
+    );
+
+    // No entry at all means "never enabled" - Shopify only writes an app
+    // embed into settings_data.json the first time it's turned on - which is
+    // a real `false`, not an "unknown".
+    return {
+      enabled: ourBlock ? ourBlock.disabled !== true : false,
+      themeEditorUrl,
+    };
+  } catch (error) {
+    console.error(`Could not read deposit notice embed status for ${shop}:`, error);
+    return { enabled: null, themeEditorUrl };
+  }
+}
+
+/**
  * Turns a deposit tier off (or back on).
  *
  * Soft, deliberately. Products carry their deposit as an amount on their own

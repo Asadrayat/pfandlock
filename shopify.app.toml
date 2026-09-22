@@ -12,7 +12,13 @@ name = "Pfandlock"
 # write_cart_transforms is Phase 2's: it's what lets the app call
 # cartTransformCreate to register the deposit-charging Cart Transform
 # function for a shop (see app/routes/app.settings.tsx).
-scopes = "write_products,write_cart_transforms"
+# read_themes is Phase 3's: there's no Admin API to switch a theme's app
+# embed on for a merchant, only to look at whether ours already is - it's
+# what lets Settings read config/settings_data.json off the shop's main
+# theme to show a real Enabled/Not enabled status next to the deep link
+# (see getDepositNoticeEmbedStatus in app/deposits.server.ts). Existing
+# installs will be prompted to accept this scope before it takes effect.
+scopes = "write_products,write_cart_transforms,read_themes"
 
 # Declarative product metafield: the field a product's deposit amount lives
 # on. This is the field the "Assign deposit" page writes to and the field the
@@ -52,7 +58,8 @@ api_version = "2026-07"
   [[webhooks.subscriptions]]
   compliance_topics = [ "customers/data_request", "customers/redact", "shop/redact" ]
   uri = "/webhooks/compliance"
-
+[pos]
+embedded = true
 [auth]
 redirect_urls = [ "https://example.com/api/auth" ]
 
